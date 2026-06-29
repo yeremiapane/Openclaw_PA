@@ -1,0 +1,166 @@
+// Package waha adalah client tipis untuk WAHA REST API.
+package waha
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"regexp"
+	"time"
+)
+
+var nonDigit = regexp.MustCompile(`\D`)
+
+// Client memanggil WAHA HTTP API.
+type Client struct {
+	baseURL string
+	apiKey  string
+	session string
+	http    *http.Client
+}
+
+// New membuat WAHA client.
+func New(baseURL, apiKey, session string) *Client {
+	return &Client{
+		baseURL: baseURL,
+		apiKey:  apiKey,
+		session: session,
+		http:    &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+// NormalizeChatID mengubah nomor (mis. "+62 852-7760-3027") menjadi
+// format chatId WAHA: "6285277603027@c.us".
+func NormalizeChatID(phone string) string {
+	digits := nonDigit.ReplaceAllString(phone, "")
+	return digits + "@c.us"
+}
+
+type sendTextReq struct {
+	Session string `json:"session"`
+	ChatID  string `json:"chatId"`
+	Text    string `json:"text"`
+}
+
+// SendText mengirim pesan teks ke nomor tujuan via WAHA.
+func (c *Client) SendText(to, text string) error {
+	payload := sendTextReq{
+		Session: c.session,
+		ChatID:  NormalizeChatID(to),
+		Text:    text,
+	}
+	body, _ := json.Marshal(payload)
+
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/api/sendText", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Api-Key", c.apiKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("kirim ke WAHA gagal: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("WAHA sendText HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	log.Printf("[OUTBOUND] -> %s : %q", payload.ChatID, text)
+	return nil
+}
+
+// SendToChat mengirim teks ke chatId yang SUDAH berformat WAHA (mis.
+// "6285...@c.us" atau "5296...@lid"). Dipakai untuk membalas ke chat asal
+// pesan masuk, sehingga balasan ke kontak @lid tidak salah dinormalisasi
+// menjadi @c.us.
+func (c *Client) SendToChat(chatID, text string) error {
+	payload := sendTextReq{
+		Session: c.session,
+		ChatID:  chatID,
+		Text:    text,
+	}
+	body, _ := json.Marshal(payload)
+
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/api/sendText", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Api-Key", c.apiKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("kirim ke WAHA gagal: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("WAHA sendText HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	log.Printf("[OUTBOUND] -> %s : %q", chatID, text)
+	return nil
+}
+
+// SessionStatus mengembalikan status session (mis. "WORKING", "STOPPED").
+func (c *Client) SessionStatus() (string, error) {
+	req, _ := http.NewRequest(http.MethodGet, c.baseURL+"/api/sessions/"+c.session, nil)
+	req.Header.Set("X-Api-Key", c.apiKey)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	var out struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	return out.Status, nil
+}
+
+// EnsureSessionStarted memastikan session WAHA aktif (status WORKING).
+// WAHA Core tidak auto-start session saat container restart, jadi API Gateway
+// memanggil ini saat boot. Auth tersimpan di volume → tidak perlu scan QR ulang.
+func (c *Client) EnsureSessionStarted() {
+	status, err := c.SessionStatus()
+	if err != nil {
+		log.Printf("[waha] tidak bisa cek status session: %v", err)
+		return
+	}
+	if status == "WORKING" {
+		log.Printf("[waha] session %q sudah WORKING", c.session)
+		return
+	}
+	log.Printf("[waha] session %q status %q — mencoba start...", c.session, status)
+
+	req, _ := http.NewRequest(http.MethodPost, c.baseURL+"/api/sessions/"+c.session+"/start", nil)
+	req.Header.Set("X-Api-Key", c.apiKey)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		log.Printf("[waha] gagal start session: %v", err)
+		return
+	}
+	resp.Body.Close()
+
+	// Poll hingga WORKING (maks ~30 dtk).
+	for i := 0; i < 10; i++ {
+		time.Sleep(3 * time.Second)
+		if s, _ := c.SessionStatus(); s == "WORKING" {
+			log.Printf("[waha] session %q kini WORKING", c.session)
+			return
+		}
+	}
+	log.Printf("[waha] session %q belum WORKING setelah start (mungkin perlu scan QR)", c.session)
+}

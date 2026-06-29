@@ -1,0 +1,40 @@
+# Secrets
+.env
+.env.example
+
+# Docker volumes & runtime data
+/data/
+/.waha/
+
+# OpenClaw runtime (keep agents/ & workspace/ tracked, ignore caches)
+/.openclaw/cache/
+/.openclaw/logs/
+
+# Go
+*.exe
+*.test
+*.out
+/bin/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# OS / editor
+Thumbs.db
+.DS_Store
+*credentials*
+/credentials/credentials.json
+
+# PNG File
+*.png
+
+# .MD File
+*.MD
+
+# Go
+go.mod
+go.sum
+
+# Log
+log.txt

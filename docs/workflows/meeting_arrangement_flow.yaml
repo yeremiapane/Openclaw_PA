@@ -1,0 +1,110 @@
+# meeting_arrangement_flow — SPEC (TIDAK DIEKSEKUSI)
+#
+# CATATAN PENTING (Fase 8):
+#   OpenClaw 2026.6.8 TIDAK menyertakan engine "Lobster". File YAML ini disimpan
+#   sebagai SPESIFIKASI alur meeting end-to-end (referensi desain dari dokumen
+#   arsitektur Section 9), BUKAN konfigurasi yang dijalankan.
+#
+#   Orkestrasi nyata ditangani oleh API Gateway (Go) lewat:
+#     - Routing per trust_level → agent (orchestrator/support/pa_communicator)
+#     - Actions terstruktur dari agent: UPDATE_STATE, NOTIFY_ORCHESTRATOR, SPAWN_AGENT
+#     - Approval gate (tabel approval_pending + notifikasi SU + perintah SETUJU/TOLAK)
+#   Lihat: services/api-gateway/src/routes/webhook.go (applyActions, holdForApproval)
+#
+#   Pemetaan step → implementasi saat ini:
+#     STEP 1 contact_external   → SPAWN_AGENT pa_communicator  (DITUNDA: butuh inisiasi outbound)
+#     STEP 2 get_su_approval    → approval gate (AKTIF di Fase 8)
+#     STEP 3 get_venue          → routing trust=semi_trusted → support (AKTIF)
+#     STEP 4 create_calendar    → Fase 9 (Calendar integration)
+#     STEP 5 send_rsvp          → Fase 9 (Email/RSVP)
+
+name: meeting_arrangement_flow
+version: "1.0"
+description: >
+  Workflow lengkap pengaturan meeting dari perintah SU hingga
+  Calendar Event dibuat dan RSVP dikirim.
+
+trigger:
+  agent: orchestrator
+  event: su_requests_meeting
+
+steps:
+  # ─── STEP 1: Hubungi Pihak Eksternal ────────────────────────────
+  - id: contact_external
+    name: Hubungi pihak eksternal
+    agent: pa_communicator
+    action: initiate_contact
+    input:
+      contact_name:  "{{trigger.contact_name}}"
+      contact_phone: "{{trigger.contact_phone}}"
+      topic:         "{{trigger.topic}}"
+      meeting_type:  "{{trigger.meeting_type}}"
+    await: schedule_agreed
+    timeout: 24h
+    on_timeout:
+      action: notify_orchestrator
+      message: "Pihak eksternal belum merespons setelah 24 jam."
+
+  # ─── STEP 2: Minta Approval SU ──────────────────────────────────
+  - id: get_su_approval
+    name: Minta approval dari SU
+    agent: orchestrator
+    action: request_su_approval
+    input:
+      proposed_datetime: "{{steps.contact_external.result.datetime}}"
+      external_name:     "{{trigger.contact_name}}"
+      external_company:  "{{trigger.contact_company}}"
+      meeting_type:      "{{trigger.meeting_type}}"
+    await: su_approved
+    timeout: 48h
+
+  # ─── STEP 3: Cek Kebutuhan Venue (jika offline) ─────────────────
+  - id: check_venue_needed
+    name: Cek apakah perlu venue
+    condition: >
+      {{trigger.meeting_type == 'offline'
+        && !steps.get_su_approval.result.venue}}
+    if_true:
+      - id: get_venue
+        name: Minta venue dari Bu Nova
+        agent: support
+        action: request_venue_from_nova
+        input:
+          datetime:   "{{steps.contact_external.result.datetime}}"
+          area:       "{{steps.get_su_approval.result.preferred_area}}"
+          attendees:  "{{trigger.attendee_count | default: 4}}"
+        await: venue_confirmed
+        timeout: 4h
+
+  # ─── STEP 4: Buat Calendar Event ────────────────────────────────
+  - id: create_calendar
+    name: Buat Google Calendar event
+    agent: orchestrator
+    action: create_calendar_event
+    input:
+      title: >
+        Meeting {{trigger.contact_name}} ({{trigger.contact_company}})
+        – {{trigger.topic}}
+      datetime:  "{{steps.contact_external.result.datetime}}"
+      venue: >
+        {{steps.get_venue.result.venue.address
+          | steps.get_su_approval.result.venue
+          | 'Online'}}
+      attendees:
+        - "{{trigger.su_email}}"
+        - "{{steps.contact_external.result.contact_email}}"
+      reminder_minutes: 180
+
+  # ─── STEP 5: Kirim RSVP & Konfirmasi ────────────────────────────
+  - id: send_rsvp
+    name: Kirim RSVP dan konfirmasi
+    agent: pa_communicator
+    action: send_rsvp_and_confirmation
+    input:
+      external_contact:  "{{trigger.contact_phone}}"
+      calendar_link:     "{{steps.create_calendar.result.calendar_link}}"
+      rsvp_link:         "{{steps.create_calendar.result.rsvp_link}}"
+      meeting_details:
+        datetime:  "{{steps.contact_external.result.datetime}}"
+        venue:     "{{steps.create_calendar.input.venue}}"
+        topic:     "{{trigger.topic}}"

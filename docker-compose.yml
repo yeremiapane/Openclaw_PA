@@ -1,0 +1,103 @@
+services:
+
+  # ─── Storage ───────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: pa_ai_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./data/redis:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: pa_ai_postgres
+    ports:
+      - "25432:5432"
+    environment:
+      POSTGRES_DB: pa_ai
+      POSTGRES_USER: pa_ai
+      POSTGRES_PASSWORD: ${DB_PASS}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pa_ai -d pa_ai"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ─── Transport ─────────────────────────────────────────────
+  waha:
+    image: devlikeapro/waha:noweb
+    container_name: pa_ai_waha
+    ports:
+      - "13000:3000"
+    volumes:
+      - ./.waha:/app/.sessions
+    environment:
+      WAHA_API_KEY: ${WAHA_API_KEY}
+      WHATSAPP_HOOK_URL: http://host.docker.internal:4000/webhook/waha
+      WHATSAPP_HOOK_EVENTS: message
+      WAHA_LOG_LEVEL: info
+      WHATSAPP_RESTART_ALL_SESSIONS: "True"
+      # NOWEB store: pemetaan @lid ↔ nomor (default utk sesi baru). Kontak yang
+      # membalas via @lid (privacy id) tetap dikenali whitelist. Resolusi utama
+      # tetap dari payload (remoteJidAlt); store ini cadangan/akselerasi.
+      WAHA_NOWEB_STORE_ENABLED: "True"
+      WAHA_NOWEB_STORE_FULLSYNC: "True"
+      WAHA_DASHBOARD_USERNAME: ${WAHA_DASHBOARD_USERNAME}
+      WAHA_DASHBOARD_PASSWORD: ${WAHA_DASHBOARD_PASSWORD}
+      WHATSAPP_SWAGGER_USERNAME: ${WAHA_DASHBOARD_USERNAME}
+      WHATSAPP_SWAGGER_PASSWORD: ${WAHA_DASHBOARD_PASSWORD}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  # ─── Integration Services (Fase 9) ────────────────────────────────
+  calendar-service:
+    build: ./services/calendar
+    container_name: pa_ai_calendar
+    ports:
+      - "4010:4010"
+    environment:
+      CALENDAR_PORT: "4010"
+      MS_GRAPH_TENANT_ID: ${MS_GRAPH_TENANT_ID}
+      MS_GRAPH_CLIENT_ID: ${MS_GRAPH_CLIENT_ID}
+      MS_GRAPH_CLIENT_SECRET: ${MS_GRAPH_CLIENT_SECRET}
+      MS_GRAPH_USER_UPN: ${MS_GRAPH_USER_UPN}
+    restart: unless-stopped
+
+  teams-service:
+    build: ./services/teams
+    container_name: pa_ai_teams
+    ports:
+      - "4030:4030"
+    environment:
+      TEAMS_PORT: "4030"
+      MS_GRAPH_TENANT_ID: ${MS_GRAPH_TENANT_ID}
+      MS_GRAPH_CLIENT_ID: ${MS_GRAPH_CLIENT_ID}
+      MS_GRAPH_CLIENT_SECRET: ${MS_GRAPH_CLIENT_SECRET}
+      MS_GRAPH_USER_UPN: ${MS_GRAPH_USER_UPN}
+    restart: unless-stopped
+
+  email-service:
+    build: ./services/email
+    container_name: pa_ai_email
+    ports:
+      - "4020:4020"
+    environment:
+      EMAIL_PORT: "4020"
+      MS_GRAPH_TENANT_ID: ${MS_GRAPH_TENANT_ID}
+      MS_GRAPH_CLIENT_ID: ${MS_GRAPH_CLIENT_ID}
+      MS_GRAPH_CLIENT_SECRET: ${MS_GRAPH_CLIENT_SECRET}
+      MS_GRAPH_USER_UPN: ${MS_GRAPH_USER_UPN}
+      FROM_NAME: "PA Asisten"
+    restart: unless-stopped

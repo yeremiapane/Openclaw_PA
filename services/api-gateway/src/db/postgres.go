@@ -263,6 +263,23 @@ CREATE TABLE IF NOT EXISTS meeting_status_history (
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_msh_meeting ON meeting_status_history (meeting_id, created_at);
+
+-- Tugas terjadwal (pengingat). Worker latar belakang memproses baris 'pending'
+-- yang fire_at-nya sudah lewat: orchestrator menyusun & mengirim pesan ke SU.
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    id          BIGSERIAL    PRIMARY KEY,
+    fire_at     TIMESTAMPTZ  NOT NULL,
+    kind        VARCHAR(32)  NOT NULL,                  -- reminder|meeting_reminder
+    note        TEXT         NOT NULL DEFAULT '',
+    meeting_id  BIGINT       REFERENCES meeting_requests(id) ON DELETE CASCADE,
+    status      VARCHAR(16)  NOT NULL DEFAULT 'pending', -- pending|fired|cancelled|error
+    created_by  VARCHAR(64)  NOT NULL DEFAULT 'su',
+    error_text  TEXT,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    fired_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_sched_due     ON scheduled_tasks (status, fire_at);
+CREATE INDEX IF NOT EXISTS idx_sched_meeting ON scheduled_tasks (meeting_id);
 `
 
 // NewStore membuka pool ke PostgreSQL.
@@ -338,11 +355,21 @@ func (s *Store) EnsureContact(ctx context.Context, phone, name, company, email s
 	if !errors.Is(err, ErrNotWhitelisted) {
 		return nil, err
 	}
-	return s.AddContact(ctx, ContactInput{
+	c, err = s.AddContact(ctx, ContactInput{
 		Phone: phone, Name: name, Company: company, Email: email,
 		TrustLevel: "external",
 		Notes:      "Dibuat otomatis dari inisiasi SU (SPAWN_AGENT)",
 	})
+	if err != nil {
+		// Balapan: dua spawn paralel ke nomor sama bisa sama-sama lolos FindContact
+		// lalu bertabrakan di unique constraint (uq_contacts_phone). Alih-alih gagal,
+		// ambil ulang kontak yang sudah keburu dibuat goroutine lain.
+		if existing, ferr := s.FindContact(ctx, model.Identifier{Kind: "phone", Value: phone}); ferr == nil {
+			return existing, nil
+		}
+		return nil, err
+	}
+	return c, nil
 }
 
 // FindContactByName mencari kontak aktif berdasarkan nama (case-insensitive).

@@ -43,9 +43,17 @@ func phoneOf(id model.Identifier) string {
 	return ""
 }
 
+// LidResolver memetakan LID WhatsApp (privacy ID) ke nomor asli (MSISDN digit-only).
+// Diimplementasikan oleh *waha.Client (engine GOWS menyimpan peta LID↔nomor).
+// Dipakai sebagai fallback whitelist saat payload `@lid` tak membawa nomor asli.
+type LidResolver interface {
+	ResolvePhoneByLid(lid string) (string, error)
+}
+
 // Auth adalah middleware pertama: parse payload, filter event message,
-// cek whitelist, dan catat kontak eksternal.
-func Auth(store *db.Store) gin.HandlerFunc {
+// cek whitelist, dan catat kontak eksternal. `lids` boleh nil (fallback resolusi
+// LID→nomor lewat WAHA dilewati).
+func Auth(store *db.Store, lids LidResolver) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		raw, _ := c.GetRawData()
 		var ev model.WahaEvent
@@ -70,7 +78,20 @@ func Auth(store *db.Store) gin.HandlerFunc {
 		// dikenali, simpan lid ke kontak untuk lookup berikutnya (best-effort).
 		lookup := id
 		if id.Kind == "lid" {
-			if pn := ev.AltPhone(); pn != "" {
+			pn := ev.AltPhone()
+			// Fallback GOWS: payload @lid kerap TIDAK membawa remoteJidAlt/participantAlt,
+			// sehingga AltPhone kosong dan kontak yang di-whitelist via NOMOR (mis. kontak
+			// yang baru di-spawn SU, lid-nya belum tercatat) tidak dikenali → ter-BLOCK.
+			// Tanyakan nomor asli ke WAHA (engine GOWS menyimpan peta LID↔nomor).
+			if pn == "" && lids != nil {
+				if rp, rerr := lids.ResolvePhoneByLid(id.Value); rerr != nil {
+					log.Printf("[WARN] resolve LID %s ke nomor gagal: %v", id.Value, rerr)
+				} else if rp != "" {
+					pn = rp
+					log.Printf("[LID] %s diresolusikan ke nomor %s via WAHA", id.Value, pn)
+				}
+			}
+			if pn != "" {
 				lookup = model.Identifier{Kind: "phone", Value: pn, Raw: ev.Payload.From}
 			}
 		}

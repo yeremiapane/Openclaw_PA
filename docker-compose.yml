@@ -36,7 +36,9 @@ services:
 
   # ─── Transport ─────────────────────────────────────────────
   waha:
-    image: devlikeapro/waha:noweb
+    # Engine GOWS (Go/whatsmeow, browser-free) — ringan seperti NOWEB tetapi
+    # MENDUKUNG kirim file/lampiran di tier Core (NOWEB mengunci sendFile ke Plus).
+    image: devlikeapro/waha:gows
     container_name: pa_ai_waha
     ports:
       - "13000:3000"
@@ -44,15 +46,11 @@ services:
       - ./.waha:/app/.sessions
     environment:
       WAHA_API_KEY: ${WAHA_API_KEY}
+      WHATSAPP_DEFAULT_ENGINE: GOWS
       WHATSAPP_HOOK_URL: http://host.docker.internal:4000/webhook/waha
       WHATSAPP_HOOK_EVENTS: message
       WAHA_LOG_LEVEL: info
       WHATSAPP_RESTART_ALL_SESSIONS: "True"
-      # NOWEB store: pemetaan @lid ↔ nomor (default utk sesi baru). Kontak yang
-      # membalas via @lid (privacy id) tetap dikenali whitelist. Resolusi utama
-      # tetap dari payload (remoteJidAlt); store ini cadangan/akselerasi.
-      WAHA_NOWEB_STORE_ENABLED: "True"
-      WAHA_NOWEB_STORE_FULLSYNC: "True"
       WAHA_DASHBOARD_USERNAME: ${WAHA_DASHBOARD_USERNAME}
       WAHA_DASHBOARD_PASSWORD: ${WAHA_DASHBOARD_PASSWORD}
       WHATSAPP_SWAGGER_USERNAME: ${WAHA_DASHBOARD_USERNAME}

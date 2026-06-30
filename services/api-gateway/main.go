@@ -66,8 +66,11 @@ func main() {
 		cfg.MSGraphUserUPN, cfg.MailFromName, cfg.SignaturePath,
 	)
 
-	h := &routes.Handler{Waha: wahaClient, Store: store, OpenClaw: openClawClient, Memory: mem, Services: svcClient, SUPhone: cfg.SUPhone, NovaPhone: cfg.NovaPhone}
+	h := &routes.Handler{Waha: wahaClient, Store: store, OpenClaw: openClawClient, Memory: mem, Services: svcClient, SUPhone: cfg.SUPhone, NovaPhone: cfg.NovaPhone, ReminderLeadMinutes: cfg.ReminderLeadMinutes}
 	admin := &routes.AdminHandler{Store: store, Gateway: h}
+
+	// --- Worker pengingat (Fase A): kirim tugas terjadwal ke SU saat jatuh tempo ---
+	h.StartScheduler(ctx)
 
 	r := gin.Default()
 
@@ -88,7 +91,7 @@ func main() {
 	webhook := r.Group("/webhook")
 	{
 		webhook.POST("/waha",
-			middleware.Auth(store),
+			middleware.Auth(store, wahaClient),
 			middleware.RateLimit(limiter, store),
 			middleware.Sanitize(cfg.MaxMsgLen, store),
 			h.WahaInbound,

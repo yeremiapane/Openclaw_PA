@@ -3,6 +3,7 @@ package waha
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -106,6 +107,91 @@ func (c *Client) SendToChat(chatID, text string) error {
 	}
 	log.Printf("[OUTBOUND] -> %s : %q", chatID, text)
 	return nil
+}
+
+// fileObj = objek file pada payload sendFile WAHA (data = base64).
+type fileObj struct {
+	Mimetype string `json:"mimetype"`
+	Filename string `json:"filename"`
+	Data     string `json:"data"`
+}
+
+type sendFileReq struct {
+	Session string  `json:"session"`
+	ChatID  string  `json:"chatId"`
+	File    fileObj `json:"file"`
+	Caption string  `json:"caption,omitempty"`
+}
+
+// SendFile mengirim satu dokumen (lampiran) ke nomor tujuan via WAHA. `data` adalah
+// byte mentah file; gateway-lah yang meng-encode base64 sesuai kontrak WAHA. Gateway
+// hanya MENGEMAS & MENGIRIM byte — ia tidak tahu/menentukan jenis atau format laporan
+// (itu wewenang agent/Claude). Endpoint /api/sendFile tersedia di WAHA Core.
+func (c *Client) SendFile(to, filename, mimetype string, data []byte, caption string) error {
+	payload := sendFileReq{
+		Session: c.session,
+		ChatID:  NormalizeChatID(to),
+		File: fileObj{
+			Mimetype: mimetype,
+			Filename: filename,
+			Data:     base64.StdEncoding.EncodeToString(data),
+		},
+		Caption: caption,
+	}
+	body, _ := json.Marshal(payload)
+
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/api/sendFile", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Api-Key", c.apiKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("kirim file ke WAHA gagal: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("WAHA sendFile HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	log.Printf("[OUTBOUND] -> %s : [FILE %s (%s, %d byte)]", payload.ChatID, filename, mimetype, len(data))
+	return nil
+}
+
+// ResolvePhoneByLid menanyakan WAHA (engine GOWS menyimpan peta LID↔nomor) untuk
+// nomor asli (MSISDN digit-only) di balik sebuah LID. Dipakai whitelist saat pesan
+// masuk `from` berupa `<lid>@lid` TANPA remoteJidAlt/participantAlt (AltPhone kosong),
+// sehingga kontak yang di-whitelist via nomor tetap dikenali. Mengembalikan string
+// kosong (tanpa error) bila WAHA tidak punya pemetaannya.
+func (c *Client) ResolvePhoneByLid(lid string) (string, error) {
+	lid = nonDigit.ReplaceAllString(lid, "") // buang "@lid" / karakter non-digit
+	if lid == "" {
+		return "", nil
+	}
+	req, _ := http.NewRequest(http.MethodGet, c.baseURL+"/api/"+c.session+"/lids/"+lid, nil)
+	req.Header.Set("X-Api-Key", c.apiKey)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("resolve lid ke WAHA gagal: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return "", nil // WAHA tak punya pemetaan untuk LID ini
+	}
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("WAHA lids HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	var out struct {
+		PN string `json:"pn"` // mis. "6282277531326@c.us"
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	return nonDigit.ReplaceAllString(out.PN, ""), nil
 }
 
 // ── Presence (indikator baca & "mengetik…") ───────────────────────

@@ -36,6 +36,9 @@ type Handler struct {
 	// orchestrator meng-spawn agent 'support' untuk koordinasi venue tetapi lupa
 	// mengisi `target` (LLM kerap mengosongkannya karena tak tahu nomor Bu Nova).
 	NovaPhone string
+	// ReminderLeadMinutes = berapa menit sebelum meeting mulai pengingat otomatis
+	// dikirim ke SU (default 15 bila <= 0).
+	ReminderLeadMinutes int
 }
 
 // agentForTrust memetakan trust_level kontak ke agent OpenClaw (Fase 8 routing).
@@ -776,6 +779,16 @@ func (h *Handler) applyActions(ctx context.Context, convID string, contact *mode
 			// SELALU melewati approval gate sebelum pesan benar-benar terkirim.
 			act := a
 			go h.spawnOutbound(contact, act, srcText)
+		case "SET_REMINDER":
+			// SU (lewat orchestrator) minta pengingat pada waktu tertentu. Disimpan ke
+			// scheduled_tasks; worker latar belakang menyuruh orchestrator menyampaikannya
+			// ke SU saat jatuh tempo. Hanya boleh dari percakapan SU (gerbang di setReminder).
+			h.setReminder(ctx, contact, a)
+		case "SEND_DOCUMENT":
+			// SU (lewat orchestrator) minta sebuah laporan/dokumen. Agent menyusun
+			// SENDIRI isi & format-nya; gateway hanya mengemas jadi file & mengirim ke
+			// SU. Hanya boleh dari percakapan SU (gerbang di sendDocument).
+			h.sendDocument(ctx, convID, contact, a, execID)
 		default:
 			if a.Type != "" {
 				log.Printf("[ACTION] tipe tidak dikenal: %q (diabaikan)", a.Type)
@@ -819,17 +832,22 @@ func (h *Handler) spawnOutbound(initiator *model.Contact, act model.Action, srcT
 		return
 	}
 
-	// Spawn ke 'support' = koordinasi venue dengan Bu Nova. Orchestrator (LLM) kerap
-	// MENGOSONGKAN `target` karena tak punya nomor Bu Nova di konteksnya. Koordinator
-	// venue selalu Bu Nova (otoritatif dari env NOVA_PHONE), jadi isi target default
-	// agar spawn tidak gugur di gerbang validasi nomor.
-	if agentID == "support" && strings.TrimSpace(act.Target) == "" &&
-		strings.TrimSpace(act.TargetName) == "" && strings.TrimSpace(h.NovaPhone) != "" {
-		act.Target = h.NovaPhone
-		if strings.TrimSpace(act.TargetName) == "" {
-			act.TargetName = "Nova"
+	// Spawn ke 'support' = koordinasi venue, dan koordinator venue SELALU Bu Nova
+	// (otoritatif dari env NOVA_PHONE). Orchestrator (LLM) kerap mengosongkan atau
+	// keliru mengisi `target` karena tak punya nomor Bu Nova di konteksnya. Maka untuk
+	// support kita PAKSA target = Nova dan (di bawah) LEWATI semua koreksi/peminjaman
+	// nomor manusia. Tanpa ini, reconcileMSISDN bisa "meminjam" satu-satunya nomor
+	// manusia di pesan SU (mis. orang yang justru ingin dihubungi SU) sehingga pesan
+	// venue "Halo Bu Nova ..." malah TERKIRIM KE KONTAK YANG SALAH.
+	if agentID == "support" {
+		if strings.TrimSpace(h.NovaPhone) == "" {
+			log.Printf("[SPAWN] support tapi NOVA_PHONE kosong — dibatalkan")
+			h.notifySpawnFailed(act.TargetName, act.Target, "nomor koordinator venue (Nova) tidak dikonfigurasi")
+			return
 		}
-		log.Printf("[SPAWN] support tanpa target — pakai koordinator venue default Bu Nova (%s)", h.NovaPhone)
+		act.Target = h.NovaPhone
+		act.TargetName = "Nova"
+		log.Printf("[SPAWN] support → koordinator venue Bu Nova (%s) [paksa; target LLM diabaikan]", h.NovaPhone)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
@@ -848,7 +866,9 @@ func (h *Handler) spawnOutbound(initiator *model.Contact, act model.Action, srcT
 	// tapi merupakan versi "garbled" (beda ≤1 digit) dari satu nomor manusia, atau
 	// hanya ada satu nomor manusia, pakai nomor manusia yang otoritatif.
 	humanNums := h.collectSUNumbers(ctx, initiator, srcText)
-	if corrected, ok := reconcileMSISDN(phone, humanNums); ok {
+	// Untuk support, target sudah DIPAKSA = Nova di atas; jangan koreksi/pinjam nomor
+	// manusia dari pesan SU (akar bug pesan venue nyasar ke kontak lain).
+	if corrected, ok := reconcileMSISDN(phone, humanNums); ok && agentID != "support" {
 		log.Printf("[SPAWN] koreksi nomor: target LLM=%q → %s (sumber: pesan SU, kandidat=%v)", phone, corrected, humanNums)
 		phone = corrected
 		chatID = waha.NormalizeChatID(phone)
@@ -859,7 +879,7 @@ func (h *Handler) spawnOutbound(initiator *model.Contact, act model.Action, srcT
 	// karena ia tak punya nomor di konteksnya — yang punya data otoritatif justru
 	// sistem (kontak whitelisted). Bila target bukan MSISDN valid, coba cocokkan
 	// act.TargetName / act.Target sebagai nama kontak dan pakai nomor tersimpan.
-	if !isValidMSISDN(phone) && h.Store != nil {
+	if agentID != "support" && !isValidMSISDN(phone) && h.Store != nil {
 		for _, cand := range []string{act.TargetName, act.Target} {
 			cand = strings.TrimSpace(cand)
 			if cand == "" || isValidMSISDN(cand) {
@@ -1656,6 +1676,10 @@ func (h *Handler) cancelDispatch(initiator *model.Contact, a model.Action) {
 	}
 	if uerr := h.Store.UpdateMeetingStatus(ctx, m.ID, "cancelled", "su", firstNonEmptyStr(reason, "dibatalkan oleh Pak Sudianto")); uerr != nil {
 		log.Printf("[CANCEL] update status meeting #%d gagal: %v", m.ID, uerr)
+	}
+	// Batalkan pengingat otomatis yang masih menunggu untuk meeting ini.
+	if cerr := h.Store.CancelTasksForMeeting(ctx, m.ID); cerr != nil {
+		log.Printf("[CANCEL] batalkan pengingat meeting #%d gagal: %v", m.ID, cerr)
 	}
 	emailNote := ""
 	if h.Services.Enabled() && det.AttendeeEmail != "" && m.ProposedDatetime != nil {
@@ -2466,6 +2490,8 @@ func (h *Handler) scheduleApprovedMeeting(ctx context.Context, approvalID int64)
 	if err := h.Store.ScheduleMeeting(ctx, m.ID, newDetails, "su", "dijadwalkan otomatis via Fase 9"); err != nil {
 		log.Printf("[SCHEDULE] tandai scheduled meeting #%d gagal: %v", m.ID, err)
 	}
+	// Pengingat otomatis beberapa menit sebelum meeting mulai.
+	h.scheduleMeetingReminder(ctx, m, det)
 	return fmt.Sprintf("\n📅 Meeting dijadwalkan (event kalender dibuat)%s.", emailNote)
 }
 
@@ -2512,6 +2538,8 @@ func (h *Handler) finalizeReschedule(ctx context.Context, m *model.MeetingReques
 	if err := h.Store.ScheduleMeeting(ctx, m.ID, newDetails, "su", "reschedule disetujui — event kalender diperbarui"); err != nil {
 		log.Printf("[RESCHEDULE] tandai scheduled meeting #%d gagal: %v", m.ID, err)
 	}
+	// Perbarui pengingat otomatis ke jadwal baru (batalkan yang lama + buat baru).
+	h.scheduleMeetingReminder(ctx, m, det)
 	return fmt.Sprintf("\n📅 Jadwal meeting diperbarui (event kalender di-update)%s.", emailNote)
 }
 

@@ -38,3 +38,5 @@ go.sum
 
 # Log
 log.txt
+
+/.waha.noweb.bak

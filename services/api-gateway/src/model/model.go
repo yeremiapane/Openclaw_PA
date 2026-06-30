@@ -284,7 +284,8 @@ type Message struct {
 // "SPAWN_AGENT" (Agent/Target/Task + opsional Target*), "CONFIRM_MEETING" (ApprovalID),
 // "RESCHEDULE_MEETING" (MeetingID+NewDatetime), "CANCEL_MEETING" (MeetingID+Reason),
 // "REQUEST_MEETING_CHANGE" (ChangeKind+Reason + opsional NewDatetime), "CONFIRM_VENUE"
-// (VenueName+VenueAddress).
+// (VenueName+VenueAddress), "SET_REMINDER" (ReminderTime+ReminderNote),
+// "SEND_DOCUMENT" (DocFilename+DocContent + opsional DocMime/DocEncoding/DocCaption).
 type Action struct {
 	Type     string `json:"type"`
 	NewState string `json:"newState,omitempty"`
@@ -316,6 +317,26 @@ type Action struct {
 	VenueName    string          `json:"venueName,omitempty"`
 	VenueAddress string          `json:"venueAddress,omitempty"`
 	Payload      json.RawMessage `json:"payload,omitempty"`
+	// SET_REMINDER (orchestrator/SU): ReminderTime = kapan pengingat dikirim
+	// (RFC3339 +07:00, mis. 2026-07-01T15:00:00+07:00); ReminderNote = isi yang
+	// ingin diingatkan. Worker latar belakang menyuruh orchestrator menyampaikannya
+	// ke Pak Sudianto saat jatuh tempo.
+	ReminderTime string `json:"reminderTime,omitempty"`
+	ReminderNote string `json:"reminderNote,omitempty"`
+	// SEND_DOCUMENT (orchestrator/SU): agent menyusun SENDIRI isi laporan/dokumen
+	// (format & isi bebas, ditentukan Claude) lalu menyerahkannya ke gateway untuk
+	// dikemas jadi file & dikirim ke Pak Sudianto. Gateway tidak menyimpan template
+	// atau logika per-jenis-laporan — ia hanya menulis byte & mengirim.
+	//   DocFilename = nama file termasuk ekstensi (mis. "Laporan Juni.csv").
+	//   DocMime     = tipe konten (mis. "text/csv"); kosong → ditebak dari ekstensi.
+	//   DocEncoding = "utf8" (default, isi teks apa adanya) | "base64" (file biner).
+	//   DocContent  = isi file (teks mentah, atau base64 bila DocEncoding=base64).
+	//   DocCaption  = keterangan singkat yang menyertai lampiran (opsional).
+	DocFilename string `json:"docFilename,omitempty"`
+	DocMime     string `json:"docMime,omitempty"`
+	DocEncoding string `json:"docEncoding,omitempty"`
+	DocContent  string `json:"docContent,omitempty"`
+	DocCaption  string `json:"docCaption,omitempty"`
 }
 
 // Approval = satu pesan keluar yang ditahan menunggu persetujuan Pak Sudianto
@@ -410,6 +431,25 @@ type MeetingRequest struct {
 	ApprovedAt       *time.Time      `json:"approved_at,omitempty"`
 	RejectedAt       *time.Time      `json:"rejected_at,omitempty"`
 	ScheduledAt      *time.Time      `json:"scheduled_at,omitempty"`
+}
+
+// ScheduledTask = satu tugas terjadwal (pengingat) yang akan dijalankan worker
+// latar belakang saat FireAt tercapai. Pada saat itu, orchestrator disuruh
+// menyusun & mengirim pesan pengingat ke Pak Sudianto (push proaktif).
+// Kind: "reminder" (diminta SU lewat SET_REMINDER) | "meeting_reminder" (otomatis
+// dibuat saat meeting dijadwalkan, beberapa menit sebelum mulai).
+// Status: pending | fired | cancelled | error.
+type ScheduledTask struct {
+	ID        int64      `json:"id"`
+	FireAt    time.Time  `json:"fire_at"`
+	Kind      string     `json:"kind"`
+	Note      string     `json:"note"`
+	MeetingID *int64     `json:"meeting_id,omitempty"`
+	Status    string     `json:"status"`
+	CreatedBy string     `json:"created_by"`
+	ErrorText string     `json:"error_text,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+	FiredAt   *time.Time `json:"fired_at,omitempty"`
 }
 
 // MeetingStatusEvent = satu transisi status pada meeting_status_history.

@@ -47,6 +47,9 @@ type Config struct {
 	NovaPhone string
 	NovaLid   string
 
+	// Pengingat (Fase A): menit sebelum meeting mulai untuk pengingat otomatis.
+	ReminderLeadMinutes int
+
 	// MS Graph (Calendar + Email) in-process, dipanggil saat approve.
 	MSGraphTenantID     string
 	MSGraphClientID     string
@@ -107,6 +110,8 @@ func Load() Config {
 		SULid:     getenv("SU_LID", ""),
 		NovaPhone: getenv("NOVA_PHONE", ""),
 		NovaLid:   getenv("NOVA_LID", ""),
+
+		ReminderLeadMinutes: getenvInt("MEETING_REMINDER_LEAD_MIN", 15),
 
 		MSGraphTenantID:     getenv("MS_GRAPH_TENANT_ID", ""),
 		MSGraphClientID:     getenv("MS_GRAPH_CLIENT_ID", ""),

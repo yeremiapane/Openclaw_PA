@@ -3,6 +3,7 @@ package model
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -17,6 +18,10 @@ type WahaEvent struct {
 		From      string `json:"from"`
 		FromMe    bool   `json:"fromMe"`
 		Body      string `json:"body"`
+		// VCards berisi kartu kontak terlampir (mis. SU mengirim kontak orang yang
+		// ingin dijadwalkan). Tiap elemen = satu kartu vCard mentah. WAHA NOWEB
+		// menyatukan kontak tunggal & jamak ke array ini; `body` kosong saat ini.
+		VCards []string `json:"vCards"`
 		// Data._data.key.remoteJidAlt menyimpan nomor asli (@s.whatsapp.net)
 		// saat `from` @lid; dipakai memetakan @lid→phone agar kontak @lid
 		// dikenali whitelist.
@@ -77,6 +82,149 @@ func (e *WahaEvent) AltPhone() string {
 		}
 	}
 	return ""
+}
+
+// VCardContact = kontak hasil parse satu kartu vCard (nama + nomor kanonik).
+type VCardContact struct {
+	Name  string // nama tampilan (FN), fallback dari N: atau kosong
+	Phone string // MSISDN digit-only, mis. "628970258733"; kosong bila tak terbaca
+}
+
+// Contacts mem-parse payload.vCards (kartu kontak WhatsApp) menjadi daftar
+// nama+nomor. Nomor diutamakan dari parameter waid= pada baris TEL (nomor kanonik
+// WA), fallback ke digit nilai TEL. Mengembalikan nil bila tak ada kartu kontak.
+func (e *WahaEvent) Contacts() []VCardContact {
+	if len(e.Payload.VCards) == 0 {
+		return nil
+	}
+	var out []VCardContact
+	for _, raw := range e.Payload.VCards {
+		c := parseVCard(raw)
+		if c.Name == "" && c.Phone == "" {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// ContactText merangkai kartu kontak terlampir menjadi teks yang dimengerti agent
+// (dan disimpan ke memori percakapan), agar nomor dapat dikorelasikan dengan maksud
+// meeting walau dikirim di giliran terpisah. Kosong bila tak ada kontak terbaca.
+func (e *WahaEvent) ContactText() string {
+	cs := e.Contacts()
+	if len(cs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	if len(cs) == 1 {
+		b.WriteString("[Kartu kontak dilampirkan]\n")
+	} else {
+		fmt.Fprintf(&b, "[%d kartu kontak dilampirkan]\n", len(cs))
+	}
+	for i, c := range cs {
+		name := c.Name
+		if name == "" {
+			name = "(tanpa nama)"
+		}
+		phone := c.Phone
+		if phone == "" {
+			phone = "(nomor tak terbaca)"
+		}
+		fmt.Fprintf(&b, "%d. %s — %s\n", i+1, name, phone)
+	}
+	b.WriteString("Gunakan kontak ini bila diminta menghubungi atau menjadwalkan pertemuan dengannya.")
+	return b.String()
+}
+
+// parseVCard mengekstrak nama (FN, fallback N) & nomor (TEL/waid) dari satu kartu
+// vCard mentah. Toleran terhadap CRLF/LF dan parameter TEL yang beragam.
+func parseVCard(raw string) VCardContact {
+	var c VCardContact
+	var nLine string
+	lines := strings.FieldsFunc(raw, func(r rune) bool { return r == '\n' || r == '\r' })
+	for _, ln := range lines {
+		ln = strings.TrimSpace(ln)
+		up := strings.ToUpper(ln)
+		switch {
+		case strings.HasPrefix(up, "FN:"):
+			if c.Name == "" {
+				c.Name = unescapeVCard(ln[len("FN:"):])
+			}
+		case strings.HasPrefix(up, "N:"):
+			nLine = ln[len("N:"):]
+		case strings.HasPrefix(up, "TEL"):
+			if c.Phone == "" {
+				c.Phone = phoneFromTEL(ln)
+			}
+		}
+	}
+	if c.Name == "" && nLine != "" {
+		// N:Family;Given;Middle;Prefix;Suffix → "Given Family"
+		parts := strings.Split(nLine, ";")
+		var family, given string
+		if len(parts) > 0 {
+			family = strings.TrimSpace(parts[0])
+		}
+		if len(parts) > 1 {
+			given = strings.TrimSpace(parts[1])
+		}
+		c.Name = unescapeVCard(strings.TrimSpace(given + " " + family))
+	}
+	if r := []rune(c.Name); len(r) > 100 { // pertahanan thd kartu jahat (nama panjang)
+		c.Name = string(r[:100])
+	}
+	return c
+}
+
+// phoneFromTEL mengambil MSISDN dari satu baris TEL vCard. Prioritas parameter
+// waid= (nomor kanonik WA), fallback ke digit pada nilai setelah ':'.
+func phoneFromTEL(line string) string {
+	paramPart, value := line, ""
+	if colon := strings.Index(line, ":"); colon >= 0 {
+		paramPart, value = line[:colon], line[colon+1:]
+	}
+	if i := strings.Index(strings.ToLower(paramPart), "waid="); i >= 0 {
+		if d := leadingDigits(paramPart[i+len("waid="):]); d != "" {
+			return normalizeMSISDN(d)
+		}
+	}
+	return normalizeMSISDN(onlyDigits(value))
+}
+
+// leadingDigits mengembalikan deret digit di AWAL string (berhenti di non-digit).
+func leadingDigits(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return s[:i]
+		}
+	}
+	return s
+}
+
+// onlyDigits membuang semua karakter selain digit.
+func onlyDigits(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] >= '0' && s[i] <= '9' {
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
+}
+
+// normalizeMSISDN menormalkan nomor lokal Indonesia ('0…') ke awalan 62.
+func normalizeMSISDN(d string) string {
+	if strings.HasPrefix(d, "0") {
+		return "62" + d[1:]
+	}
+	return d
+}
+
+// unescapeVCard membatalkan escape sederhana vCard (\n \, \; \\).
+func unescapeVCard(s string) string {
+	r := strings.NewReplacer(`\n`, " ", `\N`, " ", `\,`, ",", `\;`, ";", `\\`, `\`)
+	return strings.TrimSpace(r.Replace(s))
 }
 
 // Contact = satu baris whitelist dari tabel contacts.

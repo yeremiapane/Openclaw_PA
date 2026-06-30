@@ -166,6 +166,15 @@ func Sanitize(maxLen int, store *db.Store) gin.HandlerFunc {
 		contact := c.MustGet(CtxContact).(*model.Contact)
 		text := ev.Payload.Body
 
+		// Kartu kontak (vCard) datang dengan body kosong; ubah jadi teks ringkas
+		// (nama + nomor) agar agent bisa membacanya. Disintesis SEBELUM scan injeksi
+		// & batas panjang sehingga nama dari kartu tetap melewati filter keamanan.
+		if strings.TrimSpace(text) == "" {
+			if ct := ev.ContactText(); ct != "" {
+				text = ct
+			}
+		}
+
 		for _, re := range injectionPatterns {
 			if re.MatchString(text) {
 				cid := contact.ID

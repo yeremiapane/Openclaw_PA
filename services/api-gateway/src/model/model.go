@@ -29,7 +29,40 @@ type WahaEvent struct {
 				AddressingMode string `json:"addressingMode"`
 			} `json:"key"`
 		} `json:"_data"`
+		// ReplyTo terisi bila pesan ini adalah balasan (quote) atas pesan lain.
+		// nil bila bukan balasan. `id`/`participant` engine-dependent (bisa absen);
+		// `body` umumnya tersedia. Lihat dok WAHA: receive-messages (field replyTo).
+		ReplyTo *struct {
+			ID          string `json:"id"`
+			Participant string `json:"participant"`
+			Body        string `json:"body"`
+			HasMedia    bool   `json:"hasMedia"`
+		} `json:"replyTo"`
 	} `json:"payload"`
+}
+
+// maxReplyPreview membatasi panjang kutipan pesan yang dibalas agar preamble
+// agent tidak membengkak (pesan asal tidak melewati sanitizer panjang).
+const maxReplyPreview = 500
+
+// ReplyToText mengembalikan ringkasan teks pesan yang sedang dibalas (quote),
+// terpotong bila panjang. Kosong bila pesan ini bukan balasan / tanpa teks.
+func (e *WahaEvent) ReplyToText() string {
+	rt := e.Payload.ReplyTo
+	if rt == nil {
+		return ""
+	}
+	body := strings.TrimSpace(rt.Body)
+	if body == "" {
+		if rt.HasMedia {
+			return "[media tanpa teks]"
+		}
+		return ""
+	}
+	if len([]rune(body)) > maxReplyPreview {
+		body = string([]rune(body)[:maxReplyPreview]) + "…"
+	}
+	return body
 }
 
 // AltPhone mengembalikan nomor kanonik (hanya digit) dari remoteJidAlt/

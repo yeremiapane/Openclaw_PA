@@ -30,7 +30,7 @@ type Handler struct {
 	Store    *db.Store
 	OpenClaw *openclaw.Client
 	Memory   *memory.Service
-	Services *services.Client // Fase 9: Calendar + Email (penjadwalan saat approve)
+	Services *services.Client // Calendar + Email (penjadwalan saat approve)
 	SUPhone  string           // nomor Pak Sudianto — tujuan notifikasi approval & orchestrator
 	// NovaPhone = koordinator venue (Bu Nova). Dipakai sebagai target default saat
 	// orchestrator meng-spawn agent 'support' untuk koordinasi venue tetapi lupa
@@ -62,14 +62,11 @@ func isApprove(verb string) bool {
 	return v == "setuju" || v == "approve"
 }
 
-// WahaInbound menangani POST /webhook/waha.
-// Dipanggil setelah chain middleware auth -> rate limit -> sanitize.
-// Event, kontak, dan teks bersih sudah tersedia di context — tidak parse ulang.
+// WahaInbound menangani POST /webhook/waha setelah auth, rate limit, dan sanitize.
+// Event, kontak, dan teks bersih sudah ada di context.
 //
-// Fase 6: setelah audit, pesan di-inject ke agent pa_communicator via CLI dan
-// balasannya dikirim kembali ke chat asal. Inject bisa makan puluhan detik,
-// jadi handler langsung membalas 200 ke WAHA lalu memproses di goroutine
-// (cegah webhook timeout).
+// Pesan di-inject ke agent pa_communicator via CLI, balasan dikirim ke chat asal.
+// Karena proses bisa lama, handler langsung balas 200 ke WAHA lalu lanjut di goroutine.
 func (h *Handler) WahaInbound(c *gin.Context) {
 	ev := c.MustGet(middleware.CtxEvent).(*model.WahaEvent)
 	contact := c.MustGet(middleware.CtxContact).(*model.Contact)
@@ -101,7 +98,15 @@ func (h *Handler) WahaInbound(c *gin.Context) {
 	convID := "agent:" + agentID + ":" + keyID
 	from := ev.Payload.From
 
-	// Fase 8 approval gate: Pak Sudianto dapat menyetujui/menolak pesan tertahan
+	// Presence: tandai pesan masuk sudah dibaca (centang biru). Best-effort &
+	// di luar jalur utama agar tak menambah latensi balasan.
+	go func(chatID, msgID string) {
+		if err := h.Waha.SendSeen(chatID, msgID); err != nil {
+			log.Printf("[PRESENCE] sendSeen %s gagal: %v", chatID, err)
+		}
+	}(from, ev.Payload.ID)
+
+	// Approval gate: Pak Sudianto dapat menyetujui/menolak pesan tertahan
 	// langsung via WhatsApp ("SETUJU <id>" / "TOLAK <id>"). Ditangani sebelum
 	// routing ke agent agar tidak diperlakukan sebagai percakapan biasa.
 	if contact.TrustLevel == "su" {
@@ -112,8 +117,12 @@ func (h *Handler) WahaInbound(c *gin.Context) {
 		}
 	}
 
+	// Konteks pesan yang sedang dibalas (quote). Hanya dipakai orchestrator (SU);
+	// agent lain mengabaikannya. Diekstrak di sini selagi event masih tersedia.
+	replyTo := ev.ReplyToText()
+
 	// Proses inject + kirim balasan di luar request lifecycle WAHA.
-	go h.process(contact, agentID, convID, from, text)
+	go h.process(contact, agentID, convID, from, text, replyTo)
 
 	c.JSON(http.StatusOK, gin.H{"status": "received"})
 }
@@ -121,9 +130,15 @@ func (h *Handler) WahaInbound(c *gin.Context) {
 // process menjalankan satu turn agent (rakit konteks → inject → terapkan actions
 // → approval gate / kirim + simpan memori). Berjalan di goroutine sendiri —
 // pakai context.Background (request WAHA sudah selesai).
-func (h *Handler) process(contact *model.Contact, agentID, convID, from, text string) {
+func (h *Handler) process(contact *model.Contact, agentID, convID, from, text, replyTo string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
+
+	// Tampilkan "sedang mengetik…" saat agent memproses; auto-refresh karena
+	// WhatsApp meng-expire composing, dan defer memastikan berhenti di semua jalur.
+	typingCtx, stopTyping := context.WithCancel(ctx)
+	go h.typingKeepAlive(typingCtx, from)
+	defer stopTyping()
 
 	injectMsg := text
 	if h.Memory != nil {
@@ -131,15 +146,19 @@ func (h *Handler) process(contact *model.Contact, agentID, convID, from, text st
 		if err != nil {
 			log.Printf("[MEMORY] assemble gagal conv=%s: %v (lanjut tanpa konteks)", convID, err)
 		} else {
-			// Acuan tanggal otoritatif untuk SEMUA agent: cegah salah memetakan nama
-			// hari → tanggal (mis. "Rabu" → tanggal yang sebenarnya Kamis) saat
-			// menjadwal/reschedule. Untuk orchestrator (jalur SU) ditambah status meeting
-			// LANGSUNG dari DB — transisi approve→scheduled terjadi di luar percakapan SU,
-			// jadi tanpa ini orchestrator menjawab pertanyaan jadwal dari ingatan usang.
+			// Anchor tanggal otoritatif untuk semua agent dan status meeting real-time.
 			mc.LiveStatus = buildDateAnchor()
 			if agentID == "orchestrator" {
 				if snap := h.buildMeetingSnapshot(ctx); snap != "" {
 					mc.LiveStatus += "\n\n" + snap
+				}
+				// Konteks balasan (quote) — hanya untuk orchestrator/SU. Bila Pak
+				// Sudianto membalas pesan tertentu, sertakan kutipannya agar
+				// orchestrator paham acuan balasan beliau.
+				if replyTo != "" {
+					mc.LiveStatus += "\n\n[PESAN YANG SEDANG DIBALAS PAK SUDIANTO]\n" +
+						"Beliau menanggapi pesan ini: \"" + replyTo + "\"\n" +
+						"Pakai kutipan ini sebagai acuan konteks balasan beliau."
 				}
 			}
 			injectMsg = mc.BuildInjectMessage(text)
@@ -148,11 +167,11 @@ func (h *Handler) process(contact *model.Contact, agentID, convID, from, text st
 		}
 	}
 
-	// Fase 8: routing ke agent sesuai trust_level. injectWithRecovery menambah
+	// Routing ke agent sesuai trust_level. injectWithRecovery menambah
 	// ketahanan terhadap sesi OpenClaw yang terjebak prosa (retry + reset sesi).
 	reply, meta, err := h.injectWithRecovery(ctx, agentID, convID, injectMsg)
 
-	// Fase 8.5: catat SETIAP giliran (sukses/gagal/diam) untuk evaluasi & trace.
+	// Catat SETIAP giliran (sukses/gagal/diam) untuk evaluasi & trace.
 	if errors.Is(err, openclaw.ErrNoReply) {
 		log.Printf("[OPENCLAW] session=%s: agent memilih tidak membalas (NO_REPLY) — tidak ada kiriman", convID)
 		h.logExecution(ctx, convID, agentID, contact, injectMsg, nil, meta, "no_reply", "")
@@ -170,15 +189,14 @@ func (h *Handler) process(contact *model.Contact, agentID, convID, from, text st
 	execID := h.logExecution(ctx, convID, agentID, contact, injectMsg, reply, meta, "ok", "")
 
 	// Fase 8: terapkan actions terstruktur (UPDATE_STATE, NOTIFY_ORCHESTRATOR).
-	// `text` (pesan asli SU) diteruskan agar SPAWN_AGENT bisa mengoreksi nomor
-	// tujuan dari sumber manusia bila LLM salah ketik.
+	// `text` diteruskan agar SPAWN_AGENT bisa koreksi nomor tujuan bila LLM salah ketik.
 	h.applyActions(ctx, convID, contact, reply.Actions, execID, text)
 
 	// Simpan profil yang BARU dipelajari (email/nama) ke tabel contacts agar diingat
 	// lintas-percakapan — sehingga bot tak menanyakan ulang data yang sudah diberikan.
 	h.persistContactProfile(ctx, contact, reply)
 
-	// Fase 8 approval gate: pesan yang mengikat Pak Sudianto ditahan sampai beliau
+	// Approval gate: pesan yang mengikat Pak Sudianto ditahan sampai beliau
 	// menyetujui. Memori turn ini ditunda hingga approve (lihat handleApprovalCommand).
 	if reply.RequiresApproval {
 		h.holdForApproval(ctx, convID, agentID, contact, from, text, reply, execID)
@@ -192,6 +210,7 @@ func (h *Handler) process(contact *model.Contact, agentID, convID, from, text st
 			log.Printf("[MEMORY] write gagal conv=%s: %v", convID, err)
 		}
 	}
+	stopTyping() // hentikan indikator "mengetik…" tepat sebelum balasan terkirim
 	h.sendAndRecord(ctx, func() error { return h.Waha.SendToChat(from, reply.Response) },
 		model.OutboundMessage{
 			ExecutionID: execPtr(execID), ConversationID: convID, ContactID: cidPtr(contact),
@@ -199,8 +218,30 @@ func (h *Handler) process(contact *model.Contact, agentID, convID, from, text st
 		})
 }
 
-// wibZone = zona waktu tampilan untuk SU (WIB, UTC+7). FixedZone agar tidak
-// bergantung pada tzdata OS (Windows kerap tanpa database zona).
+// typingKeepAlive menampilkan indikator "sedang mengetik…", menyegarkannya
+// tiap ~8 dtk sampai ctx dibatalkan, lalu menghentikannya.
+func (h *Handler) typingKeepAlive(ctx context.Context, chatID string) {
+	if err := h.Waha.StartTyping(chatID); err != nil {
+		log.Printf("[PRESENCE] startTyping %s gagal: %v", chatID, err)
+	}
+	ticker := time.NewTicker(8 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			if err := h.Waha.StopTyping(chatID); err != nil {
+				log.Printf("[PRESENCE] stopTyping %s gagal: %v", chatID, err)
+			}
+			return
+		case <-ticker.C:
+			if err := h.Waha.StartTyping(chatID); err != nil {
+				log.Printf("[PRESENCE] refresh typing %s gagal: %v", chatID, err)
+			}
+		}
+	}
+}
+
+// wibZone = zona waktu tampilan untuk SU (WIB, UTC+7). FixedZone
 var wibZone = time.FixedZone("WIB", 7*3600)
 
 // Nama hari & bulan Bahasa Indonesia (Go tidak menyediakan lokalisasi bawaan).
@@ -224,16 +265,14 @@ func formatWIBLong(t time.Time) string {
 		idDays[w.Weekday()], w.Day(), idMonths[w.Month()], w.Year(), w.Hour(), w.Minute())
 }
 
-// formatWIBDate merangkai tanggal WIB tanpa jam (mis. "Senin, 30 Juni 2026").
+// formatWIBDate menyusun tanggal WIB tanpa jam (mis. "Senin, 30 Juni 2026").
 func formatWIBDate(t time.Time) string {
 	w := t.In(wibZone)
 	return fmt.Sprintf("%s, %d %s %d", idDays[w.Weekday()], w.Day(), idMonths[w.Month()], w.Year())
 }
 
-// buildDateAnchor menyusun acuan tanggal otoritatif (hari ini + tabel 14 hari ke depan
-// dengan label hari) untuk disuntikkan ke konteks agent. Tanpa ini, LLM menebak
-// pemetaan nama-hari → tanggal dan kerap meleset (mis. menyebut "Rabu" untuk tanggal
-// yang sebenarnya Kamis). Agent WAJIB memakai tabel ini, bukan menghitung sendiri.
+// buildDateAnchor buat acuan tanggal otoritatif (hari ini + 14 hari) untuk
+// agar agent menerjemahkan nama-hari ke tanggal dengan benar.
 func buildDateAnchor() string {
 	now := time.Now().In(wibZone)
 	var b strings.Builder
@@ -251,10 +290,8 @@ func buildDateAnchor() string {
 	return b.String()
 }
 
-// formatMeetingReportSU merangkai ringkasan meeting (Bahasa Indonesia) untuk
-// laporan persetujuan ke SU — TANPA menampilkan draf pesan yang akan dikirim ke
-// pihak eksternal (sesuai keputusan: SU hanya menerima laporan konfirmasi, bukan
-// salinan pesan menunggu). Mengembalikan badan laporan (tanpa header/footer).
+// formatMeetingReportSU buat ringkasan meeting (ID) untuk laporan persetujuan
+// ke SU — TANPA draf pesan ke pihak eksternal. Mengembalikan badan laporan.
 func formatMeetingReportSU(who string, reply *openclaw.AgentReply) string {
 	var b strings.Builder
 	b.WriteString(who + " telah menyetujui jadwal berikut:\n")
@@ -345,9 +382,9 @@ func (h *Handler) buildMeetingSnapshot(ctx context.Context) string {
 		// meetingId WAJIB disertakan: dipakai orchestrator untuk RESCHEDULE_MEETING /
 		// CANCEL_MEETING atas meeting yang SUDAH tercatat/terjadwal.
 		line += fmt.Sprintf(" | meetingId=%d", m.ID)
-		// Untuk meeting yang MASIH menunggu konfirmasi SU & punya approval tertaut,
-		// sertakan approvalId agar orchestrator bisa MENGONFIRMASI yang sudah ada
-		// (action CONFIRM_MEETING) alih-alih mengusulkan meeting baru (cegah duplikat).
+		// Jika meeting masih menunggu konfirmasi SU dan punya approval tertaut,
+		// sertakan approvalId agar orchestrator mengonfirmasi yang sudah ada
+		// (CONFIRM_MEETING), bukan membuat meeting baru.
 		if m.Status == "pending" && m.ApprovalID != nil {
 			line += fmt.Sprintf(" | approvalId=%d (untuk menyetujui meeting INI, pakai CONFIRM_MEETING approvalId %d — JANGAN buat meeting baru)", *m.ApprovalID, *m.ApprovalID)
 		}
@@ -1377,6 +1414,83 @@ func (h *Handler) dispatchCommunicator(ctx context.Context, m *model.MeetingRequ
 	return nil
 }
 
+// dispatchVenueRecoordination menugaskan agent 'support' menghubungi Bu Nova untuk
+// mengkoordinasikan ULANG venue meeting offline yang sedang di-reschedule. Bu Nova boleh
+// mempertahankan atau MENGGANTI lokasi (bila slot waktu baru bentrok); setelah lokasi
+// pasti ia mengonfirmasi via CONFIRM_VENUE (sertakan tanggal meeting), yang lalu memicu
+// pengajuan paket lengkap (waktu baru + venue) ke SU. Berjalan di goroutine sendiri.
+func (h *Handler) dispatchVenueRecoordination(meetingID int64, ed meetingDetails, newTime *time.Time) {
+	if strings.TrimSpace(h.NovaPhone) == "" {
+		log.Printf("[VENUE-RECOORD] NovaPhone kosong — tidak bisa koordinasi ulang venue meeting #%d", meetingID)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	m, err := h.Store.MeetingByID(ctx, meetingID)
+	if err != nil || m == nil {
+		log.Printf("[VENUE-RECOORD] meeting #%d tidak ditemukan: %v", meetingID, err)
+		return
+	}
+
+	convID := "agent:support:" + h.NovaPhone
+	chatID := waha.NormalizeChatID(h.NovaPhone)
+	nova := &model.Contact{Name: "Nova", Phone: h.NovaPhone, TrustLevel: "semi_trusted"}
+
+	who := firstNonEmptyStr(m.ExternalName, ed.AttendeeName, "pihak eksternal")
+	prevVenue := firstNonEmptyStr(strings.TrimSpace(m.Venue), ed.VenueName)
+	var b strings.Builder
+	b.WriteString("Pak Sudianto MENJADWAL ULANG pertemuan tatap muka dengan " + who + ".")
+	if newTime != nil {
+		b.WriteString(" Waktu baru yang sudah disepakati: " + formatWIBLong(*newTime) + ".")
+	}
+	if prevVenue != "" {
+		b.WriteString(" Lokasi sebelumnya: " + prevVenue + ".")
+	}
+	b.WriteString(" Mohon pastikan apakah lokasi tersebut masih tersedia pada waktu baru; bila TIDAK, " +
+		"carikan alternatif lokasi yang sesuai. Setelah lokasi PASTI, konfirmasikan venue " +
+		"(CONFIRM_VENUE) dan sertakan tanggal meeting waktu baru agar terpetakan ke pertemuan yang benar. " +
+		"Tanpa membahas biaya.")
+
+	injectMsg := buildFollowupInject(b.String())
+	if h.Memory != nil {
+		if mc, aerr := h.Memory.Assemble(ctx, convID, nova); aerr != nil {
+			log.Printf("[VENUE-RECOORD] assemble konteks gagal conv=%s: %v (lanjut tanpa konteks)", convID, aerr)
+		} else {
+			mc.LiveStatus = buildDateAnchor()
+			injectMsg = mc.BuildInjectMessage(injectMsg)
+		}
+	}
+
+	reply, meta, ierr := h.injectWithRecovery(ctx, "support", convID, injectMsg)
+	if errors.Is(ierr, openclaw.ErrNoReply) {
+		h.logExecution(ctx, convID, "support", nova, injectMsg, nil, meta, "no_reply", "")
+		log.Printf("[VENUE-RECOORD] support memilih diam untuk meeting #%d", m.ID)
+		return
+	}
+	if ierr != nil {
+		h.logExecution(ctx, convID, "support", nova, injectMsg, nil, meta, outcomeFromErr(ierr), ierr.Error())
+		log.Printf("[VENUE-RECOORD] inject support gagal meeting #%d: %v", m.ID, ierr)
+		return
+	}
+	execID := h.logExecution(ctx, convID, "support", nova, injectMsg, reply, meta, "ok", "")
+	// Bila support langsung CONFIRM_VENUE (mis. lokasi lama masih tersedia), aksi ini akan
+	// mengonfirmasi venue & memicu pengajuan paket ke SU.
+	h.applyActions(ctx, convID, nova, reply.Actions, execID, "")
+
+	if h.Memory != nil {
+		if werr := h.Memory.Write(ctx, convID, nova, "support", "[Koordinasi ulang venue reschedule] "+b.String(), reply.Response, reply.NewFacts); werr != nil {
+			log.Printf("[VENUE-RECOORD] memory write gagal conv=%s: %v", convID, werr)
+		}
+	}
+	h.sendAndRecord(ctx, func() error { return h.Waha.SendToChat(chatID, reply.Response) },
+		model.OutboundMessage{
+			ExecutionID: execPtr(execID), ConversationID: convID, ContactID: cidPtr(nova),
+			AgentID: "support", TargetChat: chatID, Kind: "agent_reply", Text: reply.Response,
+		})
+	log.Printf("[VENUE-RECOORD] Bu Nova ditugaskan koordinasi ulang venue meeting #%d (waktu baru=%v)", m.ID, newTime)
+}
+
 // rescheduleDispatch (RESCHEDULE_MEETING, SU): tandai meeting sedang dijadwal ulang,
 // lalu tugaskan PA Communicator menanyakan kesediaan pihak eksternal.
 func (h *Handler) rescheduleDispatch(initiator *model.Contact, a model.Action) {
@@ -1414,9 +1528,25 @@ func (h *Handler) rescheduleDispatch(initiator *model.Contact, a model.Action) {
 	}
 	det.ReschedulePending = true
 	det.RescheduleFrom = oldTime
-	merged, _ := json.Marshal(det)
-	if uerr := h.Store.UpdateMeetingDetails(ctx, m.ID, merged, "su", "reschedule diminta SU — menunggu konfirmasi pihak eksternal"); uerr != nil {
-		log.Printf("[RESCHEDULE] tandai pending #%d gagal: %v", m.ID, uerr)
+
+	// Meeting offline (venue-coordinated): venue harus dikoordinasikan ULANG untuk waktu
+	// baru — Bu Nova bisa mempertahankan atau MENGGANTI lokasi bila slot baru bentrok.
+	// Reset penanda venue & lepas approval lama agar loop venue + approval berjalan ulang;
+	// paket lengkap (waktu baru + venue) baru diajukan ke SU setelah Nova mengonfirmasi.
+	offlineRecoord := det.VenueCoordination
+	if offlineRecoord {
+		det.VenueConfirmed = false
+		det.TimeAgreed = false
+		merged, _ := json.Marshal(det)
+		if uerr := h.Store.ReopenMeetingForReschedule(ctx, m.ID, merged, "su",
+			"reschedule meeting offline — koordinasi ulang venue + waktu"); uerr != nil {
+			log.Printf("[RESCHEDULE] reopen offline #%d gagal: %v", m.ID, uerr)
+		}
+	} else {
+		merged, _ := json.Marshal(det)
+		if uerr := h.Store.UpdateMeetingDetails(ctx, m.ID, merged, "su", "reschedule diminta SU — menunggu konfirmasi pihak eksternal"); uerr != nil {
+			log.Printf("[RESCHEDULE] tandai pending #%d gagal: %v", m.ID, uerr)
+		}
 	}
 
 	newAt, perr := time.Parse(time.RFC3339, strings.TrimSpace(a.NewDatetime))
@@ -1439,6 +1569,10 @@ func (h *Handler) rescheduleDispatch(initiator *model.Contact, a model.Action) {
 		"Bila TIDAK bisa, tanyakan kapan waktu yang memungkinkan bagi mereka. JANGAN memastikan " +
 		"jadwal sebagai final — begitu ada kesepakatan waktu, ajukan untuk persetujuan Pak Sudianto " +
 		"(requiresApproval: true + objek meeting dengan waktu yang disepakati).")
+	if offlineRecoord {
+		b.WriteString(" Catatan: ini pertemuan tatap muka — cukup sepakati WAKTU dulu; lokasi akan " +
+			"kami koordinasikan ulang secara terpisah dan dikonfirmasikan kembali bersama jadwal final.")
+	}
 
 	if derr := h.dispatchCommunicator(ctx, m, b.String()); derr != nil {
 		log.Printf("[RESCHEDULE] dispatch PA Communicator #%d gagal: %v", m.ID, derr)
@@ -1769,6 +1903,14 @@ func (h *Handler) deferMeetingForVenue(ctx context.Context, existing *model.Meet
 			})
 	}
 
+	// Reschedule meeting offline: waktu baru sudah disepakati eksternal → tugaskan Bu Nova
+	// mengkoordinasikan ULANG venue untuk waktu baru (boleh pindah lokasi bila bentrok).
+	// Paket lengkap (waktu baru + venue) diajukan ke SU setelah Nova konfirmasi via
+	// CONFIRM_VENUE. Goroutine sendiri karena ada inject LLM.
+	if ed.ReschedulePending {
+		go h.dispatchVenueRecoordination(existing.ID, ed, proposed)
+	}
+
 	// Bila venue ternyata sudah dikonfirmasi lebih dulu, paket bisa langsung diajukan.
 	h.tryPresentVenuePackage(ctx, existing.ID)
 }
@@ -1855,11 +1997,22 @@ func (h *Handler) notifySUVenuePackage(ctx context.Context, m *model.MeetingRequ
 	if m.ProposedDatetime != nil {
 		when = formatWIBLong(*m.ProposedDatetime)
 	}
-	body := fmt.Sprintf("🔔 *Konfirmasi meeting offline diperlukan* (#%d)\n"+
+	// Reschedule meeting offline: tampilkan transisi jadwal lama → baru dan tegaskan
+	// venue sudah dikoordinasikan ulang (bisa berubah lokasi).
+	header := "🔔 *Konfirmasi meeting offline diperlukan*"
+	venueNote := "Lokasi sudah dikonfirmasi."
+	if rf := strings.TrimSpace(ed.RescheduleFrom); rf != "" {
+		header = "🔔 *Konfirmasi reschedule meeting offline diperlukan*"
+		venueNote = "Venue sudah dikoordinasikan ulang & dikonfirmasi."
+		if oldAt, perr := time.Parse(time.RFC3339, rf); perr == nil {
+			when = formatWIBLong(oldAt) + " → " + when
+		}
+	}
+	body := fmt.Sprintf("%s (#%d)\n"+
 		"Dengan: %s\n🗓️ %s\n📍 %s\nTopik: %s\n\n"+
-		"Lokasi sudah dikonfirmasi. Balas *SETUJU %d* untuk mengonfirmasi (undangan kalender + "+
+		"%s Balas *SETUJU %d* untuk mengonfirmasi (undangan kalender + "+
 		"email + konfirmasi ke pihak eksternal akan dikirim dengan lokasi ini), atau *TOLAK %d* untuk batal.",
-		apID, who, when, m.Venue, title, apID, apID)
+		header, apID, who, when, m.Venue, title, venueNote, apID, apID)
 	ap := apID
 	h.sendAndRecord(ctx, func() error { return h.Waha.SendText(h.SUPhone, body) },
 		model.OutboundMessage{
@@ -1955,6 +2108,12 @@ func (h *Handler) holdForApproval(ctx context.Context, convID, agentID string, c
 	// PASTI) baru diajukan ke SU setelah Bu Nova mengonfirmasi venue. Ini menjamin SU
 	// hanya menyetujui sekali dengan informasi lengkap, dan konfirmasi ke pihak eksternal
 	// selalu memuat lokasi pasti (keputusan: venue dulu, baru SU setuju paket lengkap).
+	//
+	// Berlaku juga untuk RESCHEDULE meeting offline: rescheduleDispatch me-reset
+	// venueConfirmed=false sehingga gerbang ini menahan kesepakatan waktu baru, lalu
+	// deferMeetingForVenue menugaskan Bu Nova mengkoordinasikan ulang venue (boleh
+	// pindah lokasi bila slot baru bentrok). Paket lengkap baru diajukan ke SU setelah
+	// venue baru dikonfirmasi.
 	if reply.Meeting != nil && h.Store != nil {
 		if existing, eerr := h.Store.ActiveMeetingByConversation(ctx, convID); eerr == nil && existing != nil {
 			var ed meetingDetails

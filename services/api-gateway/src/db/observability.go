@@ -609,6 +609,41 @@ func (s *Store) RelinkMeetingForReschedule(ctx context.Context, id, approvalID i
 	return tx.Commit(ctx)
 }
 
+// ReopenMeetingForReschedule mengembalikan meeting offline ke jalur (re)koordinasi:
+// melepas tautan approval lama (approval_id = NULL) agar tryPresentVenuePackage tidak
+// menolak resubmit, mengembalikan status ke 'pending', dan mengganti details dengan
+// penanda reschedule (reschedulePending/rescheduleFrom + venueConfirmed/timeAgreed=false).
+// Event kalender lama TETAP (di-PATCH saat finalisasi), jadi eventId disimpan di details.
+func (s *Store) ReopenMeetingForReschedule(ctx context.Context, id int64, details json.RawMessage, changedBy, reason string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM meeting_requests WHERE id = $1`, id).Scan(&status); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE meeting_requests SET
+			approval_id = NULL,
+			details     = $2,
+			status      = 'pending',
+			updated_at  = now()
+		WHERE id = $1
+	`, id, nullRaw(details)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO meeting_status_history (meeting_id, from_status, to_status, changed_by, reason)
+		VALUES ($1,$2,'pending',$3,$4)
+	`, id, status, nullStr(changedBy), nullStr(reason)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // ScheduleMeeting menandai meeting 'scheduled' (set scheduled_at), memperbarui
 // details (mis. eventId/calendarLink/teamsLink), dan menulis riwayat transisi.
 func (s *Store) ScheduleMeeting(ctx context.Context, meetingID int64, details json.RawMessage, changedBy, reason string) error {

@@ -108,6 +108,59 @@ func (c *Client) SendToChat(chatID, text string) error {
 	return nil
 }
 
+// ── Presence (indikator baca & "mengetik…") ───────────────────────
+// Semua presence bersifat best-effort: kegagalan tidak boleh mengganggu
+// jalur utama pesan. Endpoint ini tersedia di WAHA Core.
+
+type chatRef struct {
+	Session string `json:"session"`
+	ChatID  string `json:"chatId"`
+}
+
+type sendSeenReq struct {
+	Session   string `json:"session"`
+	ChatID    string `json:"chatId"`
+	MessageID string `json:"messageId,omitempty"`
+}
+
+// postJSON mengirim POST JSON ke WAHA dan memeriksa status HTTP. Dipakai
+// endpoint presence yang tak perlu membaca body respons.
+func (c *Client) postJSON(path string, payload any) error {
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Api-Key", c.apiKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("kirim ke WAHA gagal: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("WAHA %s HTTP %d: %s", path, resp.StatusCode, string(b))
+	}
+	return nil
+}
+
+// SendSeen menandai pesan masuk sebagai sudah dibaca (centang biru) di chat asal.
+func (c *Client) SendSeen(chatID, messageID string) error {
+	return c.postJSON("/api/sendSeen", sendSeenReq{Session: c.session, ChatID: chatID, MessageID: messageID})
+}
+
+// StartTyping menampilkan indikator "sedang mengetik…" di chat tujuan.
+func (c *Client) StartTyping(chatID string) error {
+	return c.postJSON("/api/startTyping", chatRef{Session: c.session, ChatID: chatID})
+}
+
+// StopTyping menghentikan indikator "sedang mengetik…".
+func (c *Client) StopTyping(chatID string) error {
+	return c.postJSON("/api/stopTyping", chatRef{Session: c.session, ChatID: chatID})
+}
+
 // SessionStatus mengembalikan status session (mis. "WORKING", "STOPPED").
 func (c *Client) SessionStatus() (string, error) {
 	req, _ := http.NewRequest(http.MethodGet, c.baseURL+"/api/sessions/"+c.session, nil)

@@ -179,7 +179,6 @@ func (te *TemplateEngine) RenderInvitation(data MeetingEmailData) (string, error
   <p style="font-size:14px; color:#333333; line-height:1.6;">
     Silakan konfirmasi kehadiran Anda. Anda juga dapat menambahkan jadwal ini ke kalender dengan membuka file <strong>.ics</strong> yang terlampir.
   </p>
-  {{end}}
 
 </td>
 </tr>

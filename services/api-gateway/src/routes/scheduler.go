@@ -33,6 +33,11 @@ func (h *Handler) StartScheduler(ctx context.Context) {
 	}
 	log.Printf("[SCHEDULER] worker pengingat aktif (poll tiap %s, susun-awal %s, lead meeting %d menit)",
 		schedulerPoll, schedulerPrepLead, h.reminderLead())
+
+	// Sekali saat start-up: tutup paket venue yang sudah lengkap (waktu+lokasi) tetapi
+	// belum pernah diajukan ke SU. Menutup celah bila sinyal agent tak lengkap saat kejadian.
+	go h.reconcileStuckVenuePackages(context.Background())
+
 	t := time.NewTicker(schedulerPoll)
 	go func() {
 		defer t.Stop()
@@ -188,6 +193,32 @@ func (h *Handler) pushToOrchestrator(ctx context.Context, task string, releaseAt
 			AgentID: agentID, TargetChat: h.SUPhone, Kind: "proactive_reply", Text: resp,
 		})
 	return nil
+}
+
+// reconcileStuckVenuePackages menutup lubang operasional: meeting offline yang paketnya
+// sudah LENGKAP (waktu disepakati + venue dikonfirmasi) tetapi belum pernah diajukan ke
+// SU — mis. karena pada saat kejadian PA Communicator hanya membalas biasa tanpa sinyal
+// terstruktur sehingga timeAgreed tak sempat tertandai, lalu belakangan diperbaiki di DB.
+// Dipanggil sekali saat start-up; idempoten (tryPresentVenuePackage melewati meeting yang
+// sudah tertaut approval).
+func (h *Handler) reconcileStuckVenuePackages(ctx context.Context) {
+	if h.Store == nil {
+		return
+	}
+	stuck, err := h.Store.FindUnpresentedVenuePackages(ctx)
+	if err != nil {
+		log.Printf("[RECONCILE] ambil paket venue tertahan gagal: %v", err)
+		return
+	}
+	if len(stuck) == 0 {
+		return
+	}
+	log.Printf("[RECONCILE] %d meeting paket-lengkap belum diajukan ke SU — mengajukan", len(stuck))
+	for i := range stuck {
+		m := stuck[i]
+		log.Printf("[RECONCILE] ajukan paket meeting #%d ke SU", m.ID)
+		h.tryPresentVenuePackage(ctx, m.ID)
+	}
 }
 
 // reminderLead mengembalikan lead time pengingat meeting (menit sebelum mulai).

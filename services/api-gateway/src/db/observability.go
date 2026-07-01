@@ -490,6 +490,53 @@ func (s *Store) FindVenuePendingMeetingByDate(ctx context.Context, wibDate strin
 	return scanMeetingRow(row)
 }
 
+// FindUnpresentedVenuePackages mengembalikan meeting offline yang PAKETNYA sudah lengkap
+// (timeAgreed=true DAN venueConfirmed=true) namun BELUM pernah diajukan ke SU (approval_id
+// masih NULL, status masih 'pending'). Dipakai reconciler saat start-up untuk menutup
+// kasus paket yang tertahan karena sinyal agent tak lengkap pada saat kejadian. Diurutkan
+// lama→baru agar deterministik.
+func (s *Store) FindUnpresentedVenuePackages(ctx context.Context) ([]model.MeetingRequest, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+meetingScanCols+`
+		FROM meeting_requests
+		WHERE COALESCE(details->>'timeAgreed','') = 'true'
+		  AND COALESCE(details->>'venueConfirmed','') = 'true'
+		  AND approval_id IS NULL
+		  AND status = 'pending'
+		ORDER BY id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []model.MeetingRequest
+	for rows.Next() {
+		m, err := scanMeetingRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		if m != nil {
+			out = append(out, *m)
+		}
+	}
+	return out, rows.Err()
+}
+
+// ActiveVenueMeetingAwaitingTime mengembalikan meeting offline pada percakapan ini yang
+// masih MENUNGGU kesepakatan WAKTU dari pihak eksternal (venueCoordination=true,
+// timeAgreed!=true, status 'pending'), atau (nil,nil). Dipakai gateway untuk menyuntik
+// penegasan ke PA Communicator agar ketika pihak eksternal menyetujui waktu, agent
+// menandai kesepakatan lewat sinyal terstruktur (requiresApproval + objek meeting).
+func (s *Store) ActiveVenueMeetingAwaitingTime(ctx context.Context, convID string) (*model.MeetingRequest, error) {
+	row := s.pool.QueryRow(ctx, `SELECT `+meetingScanCols+`
+		FROM meeting_requests
+		WHERE conversation_id = $1
+		  AND status = 'pending'
+		  AND COALESCE(details->>'venueCoordination','') = 'true'
+		  AND COALESCE(details->>'timeAgreed','') <> 'true'
+		ORDER BY id DESC LIMIT 1`, convID)
+	return scanMeetingRow(row)
+}
+
 // LinkMeetingApproval menetapkan approval_id tanpa merubah status.
 // Dipakai saat membuat approval final; juga mencatat riwayat.
 func (s *Store) LinkMeetingApproval(ctx context.Context, id, approvalID int64, changedBy, reason string) error {

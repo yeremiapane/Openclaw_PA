@@ -128,6 +128,7 @@ func main() {
 		adminGrp.GET("/outbound", admin.ListOutbound)
 		adminGrp.GET("/meetings", admin.ListMeetings)
 		adminGrp.GET("/meetings/:id/history", admin.MeetingHistory)
+		adminGrp.POST("/meetings/:id/resend-rsvp", admin.ResendRSVP)
 	}
 
 	addr := ":" + cfg.Port

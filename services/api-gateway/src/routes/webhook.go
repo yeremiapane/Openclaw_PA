@@ -163,6 +163,13 @@ func (h *Handler) process(contact *model.Contact, agentID, convID, from, text, r
 						"Beliau menanggapi pesan ini: \"" + replyTo + "\"\n" +
 						"Pakai kutipan ini sebagai acuan konteks balasan beliau."
 				}
+			} else if agentID == "pa_communicator" {
+				// Penegasan: bila percakapan ini punya meeting offline yang masih menunggu
+				// kesepakatan WAKTU, wajibkan agent menandai kesepakatan lewat sinyal
+				// terstruktur saat pihak eksternal setuju (lihat buildVenueTimeReinforcement).
+				if note := h.buildVenueTimeReinforcement(ctx, convID); note != "" {
+					mc.LiveStatus += "\n\n" + note
+				}
 			}
 			injectMsg = mc.BuildInjectMessage(text)
 			log.Printf("[MEMORY] conv=%s agent=%s returning=%v history=%d facts=%d state=%s live=%v",
@@ -907,22 +914,40 @@ func (h *Handler) spawnOutbound(initiator *model.Contact, act model.Action, srcT
 	// mengetik ulang nomor dari memorinya dan menjatuhkan digit — nomor kontak
 	// tersimpan lebih otoritatif. Bila nama+perusahaan cocok dengan kontak yang
 	// nomornya berbeda, pakai yang tersimpan (cegah kirim ke nomor salah & duplikat).
-	contact, err := h.Store.FindContactByName(ctx, act.TargetName, act.TargetCompany)
-	if err == nil && contact.Phone != phone {
-		log.Printf("[SPAWN] rekonsiliasi nomor: target LLM=%s ≠ kontak tersimpan %q=%s — pakai nomor tersimpan",
-			phone, contact.Name, contact.Phone)
-		phone = contact.Phone
-		chatID = waha.NormalizeChatID(phone)
-	} else if errors.Is(err, db.ErrNotWhitelisted) || contact == nil {
-		// Kontak belum ada (atau nama tak cocok): daftarkan baru dengan trust external.
-		contact, err = h.Store.EnsureContact(ctx, phone, act.TargetName, act.TargetCompany, act.TargetEmail)
+	var contact *model.Contact
+	var err error
+	if agentID == "support" {
+		// Target sudah DIPAKSA = NOVA_PHONE (otoritatif dari env). Ambil kontak Nova
+		// lewat NOMOR — JANGAN by-nama: bisa ada kontak lain yang juga bernama "Nova"
+		// dengan nomor berbeda, dan FindContactByName akan menimpanya (akar bug pesan
+		// venue "Halo Bu Nova ..." nyasar ke nomor salah).
+		contact, err = h.Store.FindContact(ctx, model.Identifier{Kind: "phone", Value: phone})
 		if err != nil {
-			log.Printf("[SPAWN] daftar kontak target %s gagal: %v", phone, err)
+			log.Printf("[SPAWN] kontak Nova (%s) belum ada (%v) — daftarkan", phone, err)
+			contact, err = h.Store.EnsureContact(ctx, phone, "Bu Nova", "", "")
+			if err != nil {
+				log.Printf("[SPAWN] daftar kontak Nova %s gagal: %v", phone, err)
+				return
+			}
+		}
+	} else {
+		contact, err = h.Store.FindContactByName(ctx, act.TargetName, act.TargetCompany)
+		if err == nil && contact.Phone != phone {
+			log.Printf("[SPAWN] rekonsiliasi nomor: target LLM=%s ≠ kontak tersimpan %q=%s — pakai nomor tersimpan",
+				phone, contact.Name, contact.Phone)
+			phone = contact.Phone
+			chatID = waha.NormalizeChatID(phone)
+		} else if errors.Is(err, db.ErrNotWhitelisted) || contact == nil {
+			// Kontak belum ada (atau nama tak cocok): daftarkan baru dengan trust external.
+			contact, err = h.Store.EnsureContact(ctx, phone, act.TargetName, act.TargetCompany, act.TargetEmail)
+			if err != nil {
+				log.Printf("[SPAWN] daftar kontak target %s gagal: %v", phone, err)
+				return
+			}
+		} else if err != nil {
+			log.Printf("[SPAWN] cari kontak target gagal: %v", err)
 			return
 		}
-	} else if err != nil {
-		log.Printf("[SPAWN] cari kontak target gagal: %v", err)
-		return
 	}
 
 	convID := "agent:" + agentID + ":" + phone
@@ -1816,7 +1841,7 @@ func (h *Handler) markVenueCoordination(ctx context.Context, m *model.MeetingReq
 }
 
 // confirmVenue menyimpan SATU venue pasti hasil koordinasi support↔Bu Nova ke meeting
-// offline yang sedang menunggu lokasi. TIDAK menyimpan biaya/estimasi harga (kebijakan).
+// offline yang sedang menunggu lokasi.
 // Setelah lokasi tersimpan, mencoba mengajukan paket lengkap (waktu+lokasi) ke SU.
 func (h *Handler) confirmVenue(ctx context.Context, contact *model.Contact, a model.Action) {
 	if h.Store == nil {
@@ -1828,10 +1853,6 @@ func (h *Handler) confirmVenue(ctx context.Context, contact *model.Contact, a mo
 		log.Printf("[VENUE] CONFIRM_VENUE tanpa nama venue — diabaikan")
 		return
 	}
-	// Petakan venue ke meeting yang BENAR. Bila support menyertakan tanggal meeting
-	// (meetingDatetime), cocokkan berdasarkan tanggal WIB — penting saat Bu Nova
-	// mengonfirmasi beberapa venue untuk beberapa meeting sekaligus. Bila tanpa tanggal,
-	// fallback ke meeting offline terakhir yang menunggu venue.
 	var (
 		m   *model.MeetingRequest
 		err error
@@ -1884,6 +1905,36 @@ func (h *Handler) confirmVenue(ctx context.Context, contact *model.Contact, a mo
 // offline yang lokasinya masih dikoordinasikan. Mencatat waktu yang disepakati ke meeting
 // (TimeAgreed) TANPA mengajukan ke SU, memberi tahu pihak eksternal bahwa lokasi menyusul,
 // lalu mencoba mengajukan paket lengkap bila venue ternyata sudah dikonfirmasi lebih dulu.
+// buildVenueTimeReinforcement menyuntik penegasan ke PA Communicator bila percakapan ini
+// punya meeting offline yang masih menunggu kesepakatan WAKTU. Tanpa ini, saat pihak
+// eksternal menyetujui waktu, agent kadang hanya membalas biasa (requiresApproval=false,
+// tanpa objek meeting) sehingga gateway tak pernah menandai timeAgreed dan SU tak pernah
+// diberi tahu (akar kasus meeting #10). Penegasan ini mewajibkan sinyal terstruktur saat
+// waktu disepakati sehingga deferMeetingForVenue → tryPresentVenuePackage terpicu.
+func (h *Handler) buildVenueTimeReinforcement(ctx context.Context, convID string) string {
+	if h.Store == nil {
+		return ""
+	}
+	m, err := h.Store.ActiveVenueMeetingAwaitingTime(ctx, convID)
+	if err != nil || m == nil {
+		return ""
+	}
+	when := ""
+	if m.ProposedDatetime != nil {
+		when = " (usulan waktu: " + formatWIBLong(*m.ProposedDatetime) + ")"
+	}
+	var b strings.Builder
+	b.WriteString("[MEETING MENUNGGU KESEPAKATAN WAKTU — PENTING]\n")
+	b.WriteString("Ada pertemuan offline yang sedang dikoordinasikan dengan kontak ini")
+	b.WriteString(when + ". Lokasi diurus terpisah oleh tim internal.\n")
+	b.WriteString("WAJIB: Bila pada pesan ini kontak MENYETUJUI/menyepakati waktu pertemuan ")
+	b.WriteString("(mis. \"ya bersedia\", \"boleh\", \"setuju\", \"oke, saya ikut\"), JANGAN hanya membalas biasa. ")
+	b.WriteString("Kembalikan requiresApproval=true DAN sertakan objek meeting berisi datetime ")
+	b.WriteString("(RFC3339 dengan offset +07:00) yang disepakati, plus attendeeName bila diketahui. ")
+	b.WriteString("Ini menandai waktu telah disepakati agar paket lengkap (waktu + lokasi) bisa diajukan ke Pak Sudianto.")
+	return b.String()
+}
+
 func (h *Handler) deferMeetingForVenue(ctx context.Context, existing *model.MeetingRequest, ed meetingDetails, reply *openclaw.AgentReply, contact *model.Contact, agentID, externalChat string) {
 	var proposed *time.Time
 	if m := reply.Meeting; m != nil {
@@ -2115,29 +2166,14 @@ func (h *Handler) notifyDuplicateMeeting(ctx context.Context, dup *model.Meeting
 // holdForApproval menyimpan pesan keluar yang mengikat ke approval_pending dan
 // memberi notifikasi ke Pak Sudianto (Fase 8 Step 8.5).
 func (h *Handler) holdForApproval(ctx context.Context, convID, agentID string, contact *model.Contact, from, userText string, reply *openclaw.AgentReply, execID int64) {
-	// Lapis A — penjaga anti-duplikat. Bila turn ini menyangkut meeting dengan pihak &
-	// jadwal yang SAMA dengan meeting aktif yang sudah ada di percakapan LAIN (kasus
-	// klasik: pihak eksternal sudah mengajukan & menunggu approval, lalu SU "menyetujui"
-	// lewat obrolan biasa sehingga orchestrator mengusulkan meeting baru), JANGAN buat
-	// approval/meeting kedua. Arahkan SU ke approval yang sudah ada.
+	// Lapis A — penjaga anti-duplikat.
 	if dup := h.findDuplicateMeeting(ctx, convID, contact, reply); dup != nil {
 		log.Printf("[DEDUP] conv=%s: meeting duplikat terdeteksi (cocok #%d status=%s) — approval baru DIBATALKAN", convID, dup.ID, dup.Status)
 		h.notifyDuplicateMeeting(ctx, dup)
 		return
 	}
 
-	// Gerbang koordinasi venue. Bila turn ini menyepakati WAKTU untuk meeting offline
-	// yang lokasinya masih dikoordinasikan (venue-coordination), JANGAN langsung ajukan
-	// ke SU. Catat waktu yang disepakati pada meeting tsb; paket lengkap (waktu + lokasi
-	// PASTI) baru diajukan ke SU setelah Bu Nova mengonfirmasi venue. Ini menjamin SU
-	// hanya menyetujui sekali dengan informasi lengkap, dan konfirmasi ke pihak eksternal
-	// selalu memuat lokasi pasti (keputusan: venue dulu, baru SU setuju paket lengkap).
-	//
-	// Berlaku juga untuk RESCHEDULE meeting offline: rescheduleDispatch me-reset
-	// venueConfirmed=false sehingga gerbang ini menahan kesepakatan waktu baru, lalu
-	// deferMeetingForVenue menugaskan Bu Nova mengkoordinasikan ulang venue (boleh
-	// pindah lokasi bila slot baru bentrok). Paket lengkap baru diajukan ke SU setelah
-	// venue baru dikonfirmasi.
+	// Tahan dulu meeting offline yang masih koordinasi venue; ajukan ke SU setelah venue pasti.
 	if reply.Meeting != nil && h.Store != nil {
 		if existing, eerr := h.Store.ActiveMeetingByConversation(ctx, convID); eerr == nil && existing != nil {
 			var ed meetingDetails
@@ -2179,10 +2215,8 @@ func (h *Handler) holdForApproval(ctx context.Context, convID, agentID string, c
 	h.notifySUApproval(ctx, convID, id, contact, reply)
 }
 
-// sendInterimAck memberi tahu pihak eksternal bahwa permintaannya sedang menunggu
-// konfirmasi Pak Sudianto. Dikirim segera saat pesan mengikat ditahan di approval
-// gate. Hanya untuk kontak eksternal — bila target approval adalah SU sendiri
-// (jalur orchestrator), tidak ada ack yang dikirim.
+// sendInterimAck memberi tahu pihak eksternal bahwa permintaannya menunggu
+// konfirmasi SU. Hanya untuk kontak eksternal, bukan untuk SU sendiri.
 func (h *Handler) sendInterimAck(ctx context.Context, convID, agentID string, contact *model.Contact, toChat string, apID int64) {
 	if contact == nil || contact.TrustLevel == "su" || toChat == "" {
 		return
@@ -2493,6 +2527,45 @@ func (h *Handler) scheduleApprovedMeeting(ctx context.Context, approvalID int64)
 	// Pengingat otomatis beberapa menit sebelum meeting mulai.
 	h.scheduleMeetingReminder(ctx, m, det)
 	return fmt.Sprintf("\n📅 Meeting dijadwalkan (event kalender dibuat)%s.", emailNote)
+}
+
+// ResendMeetingRSVP mengirim ulang undangan RSVP + .ics untuk meeting yang sudah dijadwalkan,
+// memakai detail tersimpan tanpa membuat event kalender baru. Mengembalikan error jika email
+// tidak diketahui, layanan nonaktif, atau pengiriman gagal.
+func (h *Handler) ResendMeetingRSVP(ctx context.Context, meetingID int64) error {
+	if h.Services == nil || !h.Services.Enabled() {
+		return fmt.Errorf("layanan email/kalender nonaktif")
+	}
+	m, err := h.Store.MeetingByID(ctx, meetingID)
+	if err != nil {
+		return fmt.Errorf("ambil meeting #%d gagal: %w", meetingID, err)
+	}
+	if m == nil {
+		return fmt.Errorf("meeting #%d tidak ditemukan", meetingID)
+	}
+	if m.ProposedDatetime == nil {
+		return fmt.Errorf("meeting #%d tanpa waktu — tak bisa kirim undangan", meetingID)
+	}
+	var det meetingDetails
+	_ = json.Unmarshal(m.Details, &det)
+	if strings.TrimSpace(det.AttendeeEmail) == "" {
+		return fmt.Errorf("meeting #%d tanpa email kontak — tak bisa kirim undangan", meetingID)
+	}
+	title := firstNonEmptyStr(det.Title, m.Topic, "Meeting")
+	duration := det.DurationMinutes
+	if duration <= 0 {
+		duration = 60
+	}
+	if err := h.Services.SendRSVP(ctx, services.RSVPReq{
+		To: det.AttendeeEmail, ToName: firstNonEmptyStr(det.AttendeeName, m.ExternalName, det.AttendeeEmail),
+		Title: title, Datetime: m.ProposedDatetime.Format(time.RFC3339), DurationMinutes: duration,
+		Venue: m.Venue, CalendarLink: det.CalendarLink, TeamsLink: det.TeamsLink,
+	}); err != nil {
+		log.Printf("[RSVP-RESEND] meeting #%d ke %s gagal: %v", meetingID, det.AttendeeEmail, err)
+		return fmt.Errorf("kirim undangan gagal: %w", err)
+	}
+	log.Printf("[RSVP-RESEND] undangan meeting #%d terkirim ulang ke %s", meetingID, det.AttendeeEmail)
+	return nil
 }
 
 // finalizeReschedule menyelesaikan reschedule yang sudah disetujui SU: PATCH event O365

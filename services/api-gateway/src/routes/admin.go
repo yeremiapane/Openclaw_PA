@@ -318,3 +318,19 @@ func (h *AdminHandler) MeetingHistory(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"history": rows, "count": len(rows)})
 }
+
+// ResendRSVP: POST /admin/meetings/:id/resend-rsvp — kirim ulang email undangan (RSVP + .ics)
+// untuk meeting yang sudah dijadwalkan, tanpa membuat event kalender baru. Untuk memulihkan
+// kegagalan pengiriman email.
+func (h *AdminHandler) ResendRSVP(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "id tidak valid"})
+		return
+	}
+	if err := h.Gateway.ResendMeetingRSVP(c.Request.Context(), id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "meeting_id": id})
+}

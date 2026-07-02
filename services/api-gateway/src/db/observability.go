@@ -490,18 +490,18 @@ func (s *Store) FindVenuePendingMeetingByDate(ctx context.Context, wibDate strin
 	return scanMeetingRow(row)
 }
 
-// FindUnpresentedVenuePackages mengembalikan meeting offline yang PAKETNYA sudah lengkap
-// (timeAgreed=true DAN venueConfirmed=true) namun BELUM pernah diajukan ke SU (approval_id
-// masih NULL, status masih 'pending'). Dipakai reconciler saat start-up untuk menutup
-// kasus paket yang tertahan karena sinyal agent tak lengkap pada saat kejadian. Diurutkan
+// FindUnfinalizedOfflineMeetings mengembalikan meeting offline yang WAKTU-nya sudah
+// disetujui SU (status 'approved') DAN lokasinya sudah dikonfirmasi (venueConfirmed=true)
+// namun BELUM difinalisasi menjadi 'scheduled' — mis. karena proses finalisasi terputus.
+// Dipakai reconciler saat start-up untuk menuntaskan finalisasi yang tertahan. Diurutkan
 // lama→baru agar deterministik.
-func (s *Store) FindUnpresentedVenuePackages(ctx context.Context) ([]model.MeetingRequest, error) {
+func (s *Store) FindUnfinalizedOfflineMeetings(ctx context.Context) ([]model.MeetingRequest, error) {
 	rows, err := s.pool.Query(ctx, `SELECT `+meetingScanCols+`
 		FROM meeting_requests
-		WHERE COALESCE(details->>'timeAgreed','') = 'true'
+		WHERE COALESCE(details->>'venueCoordination','') = 'true'
+		  AND COALESCE(details->>'timeAgreed','') = 'true'
 		  AND COALESCE(details->>'venueConfirmed','') = 'true'
-		  AND approval_id IS NULL
-		  AND status = 'pending'
+		  AND status = 'approved'
 		ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
@@ -657,8 +657,8 @@ func (s *Store) RelinkMeetingForReschedule(ctx context.Context, id, approvalID i
 }
 
 // ReopenMeetingForReschedule mengembalikan meeting offline ke jalur (re)koordinasi:
-// melepas tautan approval lama (approval_id = NULL) agar tryPresentVenuePackage tidak
-// menolak resubmit, mengembalikan status ke 'pending', dan mengganti details dengan
+// melepas tautan approval lama (approval_id = NULL) agar persetujuan waktu baru dapat
+// diajukan ulang, mengembalikan status ke 'pending', dan mengganti details dengan
 // penanda reschedule (reschedulePending/rescheduleFrom + venueConfirmed/timeAgreed=false).
 // Event kalender lama TETAP (di-PATCH saat finalisasi), jadi eventId disimpan di details.
 func (s *Store) ReopenMeetingForReschedule(ctx context.Context, id int64, details json.RawMessage, changedBy, reason string) error {

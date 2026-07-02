@@ -95,6 +95,23 @@ func (s *Store) DecideApproval(ctx context.Context, id int64, status string) (*m
 	return a, err
 }
 
+// UpdateApprovalResponse memperbarui teks pesan tertahan (response_text) sebuah approval
+// yang MASIH pending — dipakai bila kesepakatan waktu meeting offline berubah setelah
+// approval diajukan tetapi sebelum SU memutuskan. Mengembalikan ErrApprovalNotFound bila
+// approval tidak ada atau sudah diputuskan (sehingga tidak menimpa keputusan final).
+func (s *Store) UpdateApprovalResponse(ctx context.Context, id int64, responseText string) error {
+	ct, err := s.pool.Exec(ctx, `
+		UPDATE approval_pending SET response_text = $2
+		 WHERE id = $1 AND status = 'pending'`, id, responseText)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrApprovalNotFound
+	}
+	return nil
+}
+
 // rowScanner menyatukan pgx.Row dan pgx.Rows untuk scan bersama.
 type rowScanner interface {
 	Scan(dest ...any) error

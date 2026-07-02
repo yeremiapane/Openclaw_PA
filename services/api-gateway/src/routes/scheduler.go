@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
+	"pa-ai/api-gateway/src/db"
 	"pa-ai/api-gateway/src/model"
 	"pa-ai/api-gateway/src/openclaw"
 )
@@ -34,9 +36,9 @@ func (h *Handler) StartScheduler(ctx context.Context) {
 	log.Printf("[SCHEDULER] worker pengingat aktif (poll tiap %s, susun-awal %s, lead meeting %d menit)",
 		schedulerPoll, schedulerPrepLead, h.reminderLead())
 
-	// Sekali saat start-up: tutup paket venue yang sudah lengkap (waktu+lokasi) tetapi
-	// belum pernah diajukan ke SU. Menutup celah bila sinyal agent tak lengkap saat kejadian.
-	go h.reconcileStuckVenuePackages(context.Background())
+	// Sekali saat start-up: tuntaskan meeting offline yang waktunya sudah disetujui SU &
+	// lokasinya sudah dikonfirmasi Bu Nova tetapi finalisasinya tertahan (mis. terputus).
+	go h.reconcileUnfinalizedOfflineMeetings(context.Background())
 
 	t := time.NewTicker(schedulerPoll)
 	go func() {
@@ -78,7 +80,15 @@ func (h *Handler) fireTask(ctx context.Context, task model.ScheduledTask) {
 	fctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
-	if err := h.pushToOrchestrator(fctx, buildReminderInstruction(task), task.FireAt); err != nil {
+	err := h.pushToOrchestrator(fctx, buildReminderInstruction(task), task.FireAt)
+
+	// Reschedule-on-fire: untuk pengingat BERULANG, jadwalkan kejadian berikutnya
+	// sekarang (idempoten — ClaimDueTasks memfire tiap baris tepat sekali). INILAH
+	// jaminan keandalan seri (Go, bukan LLM). Dilakukan baik kirim sukses maupun gagal:
+	// kegagalan kirim sesaat tak boleh mematikan seri harian/mingguan.
+	h.rearmRecurring(context.Background(), task)
+
+	if err != nil {
 		log.Printf("[SCHEDULER] tugas #%d (%s) gagal kirim: %v", task.ID, task.Kind, err)
 		if e := h.Store.MarkTaskError(context.Background(), task.ID, err.Error()); e != nil {
 			log.Printf("[SCHEDULER] tandai error tugas #%d gagal: %v", task.ID, e)
@@ -86,6 +96,91 @@ func (h *Handler) fireTask(ctx context.Context, task model.ScheduledTask) {
 		return
 	}
 	log.Printf("[SCHEDULER] tugas #%d (%s) tersampaikan ke SU", task.ID, task.Kind)
+}
+
+// rearmRecurring menyisipkan baris pending baru untuk kejadian berikutnya sebuah
+// pengingat berulang. No-op untuk pengingat sekali-tembak. Kejadian berikutnya dihitung
+// RELATIF terhadap now (bukan FireAt) sehingga bila scheduler sempat mati, seri langsung
+// melompat ke slot masa depan berikutnya alih-alih meledak mengejar yang terlewat.
+func (h *Handler) rearmRecurring(ctx context.Context, task model.ScheduledTask) {
+	if task.RecurKind == "" || task.RecurKind == "none" {
+		return
+	}
+	next, ok := nextOccurrence(task, time.Now())
+	if !ok {
+		log.Printf("[SCHEDULER] rekurensi #%d tak bisa dihitung (kind=%q time=%q dow=%v) — seri berhenti",
+			task.ID, task.RecurKind, task.RecurTime, task.RecurDow)
+		return
+	}
+	id, err := h.Store.CreateScheduledTask(ctx, model.ScheduledTask{
+		FireAt:    next,
+		Kind:      task.Kind,
+		Note:      task.Note,
+		CreatedBy: task.CreatedBy,
+		RecurKind: task.RecurKind,
+		RecurTime: task.RecurTime,
+		RecurDow:  task.RecurDow,
+		Label:     task.Label,
+	})
+	if err != nil {
+		log.Printf("[SCHEDULER] jadwalkan ulang pengingat berulang #%d gagal: %v", task.ID, err)
+		return
+	}
+	log.Printf("[SCHEDULER] pengingat berulang #%d → kejadian berikut #%d pada %s",
+		task.ID, id, next.In(wibZone).Format("2006-01-02 15:04 WIB"))
+}
+
+// nextOccurrence menghitung kejadian berulang berikutnya, STRICTLY setelah `from`.
+// RecurTime "HH:MM" ditafsirkan di WIB. daily → slot HH:MM berikutnya; weekly → hari
+// RecurDow (0=Minggu..6=Sabtu) berikutnya pada HH:MM. ok=false bila parameter tak valid.
+func nextOccurrence(task model.ScheduledTask, from time.Time) (time.Time, bool) {
+	hh, mm, ok := parseHHMM(task.RecurTime)
+	if !ok {
+		return time.Time{}, false
+	}
+	base := from.In(wibZone)
+	slot := func(d time.Time) time.Time {
+		return time.Date(d.Year(), d.Month(), d.Day(), hh, mm, 0, 0, wibZone)
+	}
+	switch task.RecurKind {
+	case "daily":
+		cand := slot(base)
+		if !cand.After(from) {
+			cand = cand.AddDate(0, 0, 1)
+		}
+		return cand, true
+	case "weekly":
+		if task.RecurDow == nil || *task.RecurDow < 0 || *task.RecurDow > 6 {
+			return time.Time{}, false
+		}
+		want := time.Weekday(*task.RecurDow)
+		cand := slot(base)
+		for i := 0; i < 8; i++ { // maks 8 hari cukup menemukan dow berikutnya
+			if cand.Weekday() == want && cand.After(from) {
+				return cand, true
+			}
+			cand = cand.AddDate(0, 0, 1)
+		}
+		return time.Time{}, false
+	default:
+		return time.Time{}, false
+	}
+}
+
+// parseHHMM memparse "HH:MM" (24 jam). Mengembalikan ok=false bila format salah atau
+// di luar rentang.
+func parseHHMM(s string) (hh, mm int, ok bool) {
+	s = strings.TrimSpace(s)
+	parts := strings.Split(s, ":")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	h, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	m, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, 0, false
+	}
+	return h, m, true
 }
 
 // holdUntil menahan goroutine sampai releaseAt (menghormati pembatalan ctx). Bila
@@ -152,6 +247,12 @@ func (h *Handler) pushToOrchestrator(ctx context.Context, task string, releaseAt
 			if snap := h.buildMeetingSnapshot(ctx); snap != "" {
 				mc.LiveStatus += "\n\n" + snap
 			}
+			if snap := h.buildReminderSnapshot(ctx); snap != "" {
+				mc.LiveStatus += "\n\n" + snap
+			}
+			if snap := h.buildPersonaSnapshot(ctx); snap != "" {
+				mc.LiveStatus += "\n\n" + snap
+			}
 			injectMsg = mc.BuildInjectMessage(task)
 		}
 	}
@@ -195,29 +296,28 @@ func (h *Handler) pushToOrchestrator(ctx context.Context, task string, releaseAt
 	return nil
 }
 
-// reconcileStuckVenuePackages menutup lubang operasional: meeting offline yang paketnya
-// sudah LENGKAP (waktu disepakati + venue dikonfirmasi) tetapi belum pernah diajukan ke
-// SU — mis. karena pada saat kejadian PA Communicator hanya membalas biasa tanpa sinyal
-// terstruktur sehingga timeAgreed tak sempat tertandai, lalu belakangan diperbaiki di DB.
-// Dipanggil sekali saat start-up; idempoten (tryPresentVenuePackage melewati meeting yang
-// sudah tertaut approval).
-func (h *Handler) reconcileStuckVenuePackages(ctx context.Context) {
+// reconcileUnfinalizedOfflineMeetings menutup lubang operasional: meeting offline yang
+// waktunya sudah disetujui SU DAN lokasinya sudah dikonfirmasi Bu Nova, tetapi finalisasinya
+// (event kalender + undangan + konfirmasi eksternal) tertahan — mis. proses sebelumnya
+// terputus. Dipanggil sekali saat start-up; idempoten (finalizeOfflineMeeting melewati
+// meeting yang sudah 'scheduled').
+func (h *Handler) reconcileUnfinalizedOfflineMeetings(ctx context.Context) {
 	if h.Store == nil {
 		return
 	}
-	stuck, err := h.Store.FindUnpresentedVenuePackages(ctx)
+	stuck, err := h.Store.FindUnfinalizedOfflineMeetings(ctx)
 	if err != nil {
-		log.Printf("[RECONCILE] ambil paket venue tertahan gagal: %v", err)
+		log.Printf("[RECONCILE] ambil meeting offline tertahan gagal: %v", err)
 		return
 	}
 	if len(stuck) == 0 {
 		return
 	}
-	log.Printf("[RECONCILE] %d meeting paket-lengkap belum diajukan ke SU — mengajukan", len(stuck))
+	log.Printf("[RECONCILE] %d meeting offline siap difinalisasi — menuntaskan", len(stuck))
 	for i := range stuck {
 		m := stuck[i]
-		log.Printf("[RECONCILE] ajukan paket meeting #%d ke SU", m.ID)
-		h.tryPresentVenuePackage(ctx, m.ID)
+		log.Printf("[RECONCILE] finalisasi meeting offline #%d", m.ID)
+		h.finalizeOfflineMeeting(m.ID)
 	}
 }
 
@@ -296,14 +396,68 @@ func (h *Handler) setReminder(ctx context.Context, initiator *model.Contact, a m
 		log.Printf("[REMINDER] DITOLAK: inisiator non-SU (trust=%s)", trust)
 		return
 	}
+	// Jangan gagalkan lebih awal bila reminderTime kosong/invalid: pengingat BERULANG
+	// boleh mengandalkan recurTime saja. Validasi waktu ditangani per-cabang di bawah.
 	when, err := parseReminderTime(a.ReminderTime)
-	if err != nil {
-		log.Printf("[REMINDER] waktu tidak valid %q: %v (diabaikan)", a.ReminderTime, err)
-		return
-	}
 	note := firstNonEmptyStr(strings.TrimSpace(a.ReminderNote), strings.TrimSpace(a.Task))
 	if note == "" {
 		log.Printf("[REMINDER] catatan kosong — diabaikan")
+		return
+	}
+
+	// Rekurensi (opsional). "" / "none" = sekali tembak.
+	recurKind := strings.ToLower(strings.TrimSpace(a.RecurKind))
+	if recurKind == "none" {
+		recurKind = ""
+	}
+	label := strings.TrimSpace(a.ReminderLabel)
+	if r := []rune(label); len(r) > 80 {
+		label = string(r[:80])
+	}
+
+	if recurKind != "" {
+		if recurKind != "daily" && recurKind != "weekly" {
+			log.Printf("[REMINDER] recurKind tak dikenal %q — diabaikan", a.RecurKind)
+			return
+		}
+		if _, _, ok := parseHHMM(a.RecurTime); !ok {
+			log.Printf("[REMINDER] recurTime tak valid %q (butuh HH:MM) — diabaikan", a.RecurTime)
+			return
+		}
+		if recurKind == "weekly" && (a.RecurDow == nil || *a.RecurDow < 0 || *a.RecurDow > 6) {
+			log.Printf("[REMINDER] weekly butuh recurDow 0-6 — diabaikan (dapat %v)", a.RecurDow)
+			return
+		}
+		// Kejadian PERTAMA: pakai ReminderTime bila diberikan & valid, jika tidak
+		// turunkan dari parameter rekurensi (slot berikutnya dari sekarang).
+		first := when
+		if err != nil { // ReminderTime tak diberikan/valid → turunkan
+			t, ok := nextOccurrence(model.ScheduledTask{RecurKind: recurKind, RecurTime: a.RecurTime, RecurDow: a.RecurDow}, time.Now())
+			if !ok {
+				log.Printf("[REMINDER] tak bisa menghitung kejadian pertama berulang — diabaikan")
+				return
+			}
+			first = t
+		} else if first.Before(time.Now().Add(-1 * time.Minute)) {
+			log.Printf("[REMINDER] waktu pertama sudah lewat (%s) — diabaikan", first.In(wibZone).Format("2006-01-02 15:04 WIB"))
+			return
+		}
+		id, cerr := h.Store.CreateScheduledTask(ctx, model.ScheduledTask{
+			FireAt: first, Kind: "reminder", Note: note, CreatedBy: "su",
+			RecurKind: recurKind, RecurTime: strings.TrimSpace(a.RecurTime), RecurDow: a.RecurDow, Label: label,
+		})
+		if cerr != nil {
+			log.Printf("[REMINDER] simpan pengingat berulang gagal: %v", cerr)
+			return
+		}
+		log.Printf("[REMINDER] pengingat berulang #%d (%s %s) mulai %s: %q", id, recurKind,
+			strings.TrimSpace(a.RecurTime), first.In(wibZone).Format("2006-01-02 15:04 WIB"), note)
+		return
+	}
+
+	// Sekali tembak: ReminderTime wajib valid.
+	if err != nil {
+		log.Printf("[REMINDER] waktu tidak valid %q: %v (diabaikan)", a.ReminderTime, err)
 		return
 	}
 	if when.Before(time.Now().Add(-1 * time.Minute)) {
@@ -311,7 +465,7 @@ func (h *Handler) setReminder(ctx context.Context, initiator *model.Contact, a m
 		return
 	}
 	id, err := h.Store.CreateScheduledTask(ctx, model.ScheduledTask{
-		FireAt: when, Kind: "reminder", Note: note, CreatedBy: "su",
+		FireAt: when, Kind: "reminder", Note: note, CreatedBy: "su", Label: label,
 	})
 	if err != nil {
 		log.Printf("[REMINDER] simpan gagal: %v", err)
@@ -319,6 +473,90 @@ func (h *Handler) setReminder(ctx context.Context, initiator *model.Contact, a m
 	}
 	log.Printf("[REMINDER] pengingat #%d dijadwalkan %s: %q", id,
 		when.In(wibZone).Format("2006-01-02 15:04 WIB"), note)
+}
+
+// cancelReminder menjalankan action CANCEL_REMINDER: SU (lewat orchestrator) menghentikan
+// sebuah pengingat aktif berdasarkan reminderId (dari snapshot [PENGINGAT AKTIF]). Untuk
+// pengingat berulang, ini menghentikan seluruh seri. Gerbang ganda: inisiator harus
+// ber-trust 'su' DAN CancelScheduledTask hanya menyentuh baris created_by='su'.
+func (h *Handler) cancelReminder(ctx context.Context, initiator *model.Contact, a model.Action) {
+	if initiator == nil || initiator.TrustLevel != "su" {
+		trust := "(nil)"
+		if initiator != nil {
+			trust = initiator.TrustLevel
+		}
+		log.Printf("[REMINDER] CANCEL DITOLAK: inisiator non-SU (trust=%s)", trust)
+		return
+	}
+	if a.ReminderID <= 0 {
+		log.Printf("[REMINDER] CANCEL tanpa reminderId — diabaikan")
+		return
+	}
+	err := h.Store.CancelScheduledTask(ctx, a.ReminderID, "su")
+	if errors.Is(err, db.ErrScheduledTaskNotFound) {
+		log.Printf("[REMINDER] CANCEL #%d: tidak ditemukan / bukan pengingat aktif SU", a.ReminderID)
+		return
+	}
+	if err != nil {
+		log.Printf("[REMINDER] CANCEL #%d gagal: %v", a.ReminderID, err)
+		return
+	}
+	log.Printf("[REMINDER] pengingat #%d dibatalkan (seri berulang, bila ada, berhenti)", a.ReminderID)
+}
+
+// buildReminderSnapshot merakit ringkasan pengingat AKTIF milik SU langsung dari
+// PostgreSQL untuk disisipkan ke konteks orchestrator — sehingga SU bisa menanyakan
+// & membatalkannya (CANCEL_REMINDER) tanpa perlu action LIST khusus.
+func (h *Handler) buildReminderSnapshot(ctx context.Context) string {
+	if h.Store == nil {
+		return ""
+	}
+	tasks, err := h.Store.ListActiveTasks(ctx, "su", 50)
+	if err != nil {
+		log.Printf("[SNAPSHOT] ambil pengingat gagal: %v", err)
+		return ""
+	}
+	if len(tasks) == 0 {
+		return ""
+	}
+	var rows []string
+	for _, t := range tasks {
+		when := t.FireAt.In(wibZone).Format("Mon 02 Jan 2006 15:04") + " WIB"
+		recur := ""
+		switch t.RecurKind {
+		case "daily":
+			recur = " | BERULANG tiap hari " + t.RecurTime
+		case "weekly":
+			recur = " | BERULANG tiap " + weekdayIndo(t.RecurDow) + " " + t.RecurTime
+		}
+		label := t.Label
+		if label == "" {
+			label = truncateRunes(t.Note, 40)
+		}
+		rows = append(rows, fmt.Sprintf("- reminderId=%d | %s | mulai %s%s", t.ID, label, when, recur))
+	}
+	return "[PENGINGAT AKTIF — data LANGSUNG & OTORITATIF dari sistem. Untuk MEMBATALKAN/" +
+		"menghentikan sebuah pengingat, pakai CANCEL_REMINDER dengan reminderId di bawah. " +
+		"Untuk MENGUBAH jadwalnya, batalkan lalu buat baru dengan SET_REMINDER.]\n" +
+		strings.Join(rows, "\n")
+}
+
+// weekdayIndo memetakan 0-6 (Minggu..Sabtu) ke nama hari Indonesia.
+func weekdayIndo(dow *int) string {
+	names := []string{"Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"}
+	if dow == nil || *dow < 0 || *dow > 6 {
+		return "?"
+	}
+	return names[*dow]
+}
+
+// truncateRunes memotong string ke maksimal n rune (menambahkan "…" bila terpotong).
+func truncateRunes(s string, n int) string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) <= n {
+		return string(r)
+	}
+	return string(r[:n]) + "…"
 }
 
 // parseReminderTime memparse waktu pengingat. Utamakan RFC3339 (berzona); bila

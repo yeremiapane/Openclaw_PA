@@ -275,11 +275,29 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     status      VARCHAR(16)  NOT NULL DEFAULT 'pending', -- pending|fired|cancelled|error
     created_by  VARCHAR(64)  NOT NULL DEFAULT 'su',
     error_text  TEXT,
+    recur_kind  VARCHAR(16)  NOT NULL DEFAULT 'none',   -- none|daily|weekly
+    recur_time  VARCHAR(5),                             -- "HH:MM" WIB (berulang)
+    recur_dow   SMALLINT,                               -- 0-6 (weekly)
+    label       VARCHAR(80)  NOT NULL DEFAULT '',       -- rujukan singkat untuk SU
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
     fired_at    TIMESTAMPTZ
 );
+-- Migrasi aditif untuk instalasi lama (kolom rekurensi ditambahkan setelah rilis awal).
+ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS recur_kind VARCHAR(16) NOT NULL DEFAULT 'none';
+ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS recur_time VARCHAR(5);
+ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS recur_dow  SMALLINT;
+ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS label      VARCHAR(80) NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_sched_due     ON scheduled_tasks (status, fire_at);
 CREATE INDEX IF NOT EXISTS idx_sched_meeting ON scheduled_tasks (meeting_id);
+
+-- agent_preferences: overlay GAYA & SEBAGIAN PERILAKU per-agent yang disetel Pak Sudianto.
+-- Disuntik sebagai KONTEKS tiap giliran; TIDAK menimpa SOUL.md inti (approval/keamanan/
+-- output-contract tetap otoritatif). Satu baris per agent (saat ini hanya "orchestrator").
+CREATE TABLE IF NOT EXISTS agent_preferences (
+    agent      VARCHAR(32)  PRIMARY KEY,
+    prefs      TEXT         NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
 `
 
 // NewStore membuka pool ke PostgreSQL.

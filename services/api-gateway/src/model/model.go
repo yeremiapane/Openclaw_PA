@@ -284,8 +284,10 @@ type Message struct {
 // "SPAWN_AGENT" (Agent/Target/Task + opsional Target*), "CONFIRM_MEETING" (ApprovalID),
 // "RESCHEDULE_MEETING" (MeetingID+NewDatetime), "CANCEL_MEETING" (MeetingID+Reason),
 // "REQUEST_MEETING_CHANGE" (ChangeKind+Reason + opsional NewDatetime), "CONFIRM_VENUE"
-// (VenueName+VenueAddress), "SET_REMINDER" (ReminderTime+ReminderNote),
-// "SEND_DOCUMENT" (DocFilename+DocContent + opsional DocMime/DocEncoding/DocCaption).
+// (VenueName+VenueAddress), "SET_REMINDER" (ReminderTime+ReminderNote + opsional
+// RecurKind/RecurTime/RecurDow/ReminderLabel), "CANCEL_REMINDER" (ReminderID),
+// "SEND_DOCUMENT" (DocFilename+DocContent + opsional DocMime/DocEncoding/DocCaption),
+// "UPDATE_AGENT_PERSONA" (PersonaText + opsional TargetAgent).
 type Action struct {
 	Type     string `json:"type"`
 	NewState string `json:"newState,omitempty"`
@@ -313,30 +315,48 @@ type Action struct {
 	// Reason = alasan singkat untuk CANCEL_MEETING / RESCHEDULE_MEETING / REQUEST_MEETING_CHANGE.
 	Reason string `json:"reason,omitempty"`
 	// ChangeKind = jenis perubahan yang diminta untuk REQUEST_MEETING_CHANGE.
-	ChangeKind string `json:"changeKind,omitempty"`
+	ChangeKind   string          `json:"changeKind,omitempty"`
 	VenueName    string          `json:"venueName,omitempty"`
 	VenueAddress string          `json:"venueAddress,omitempty"`
 	Payload      json.RawMessage `json:"payload,omitempty"`
-	// SET_REMINDER (orchestrator/SU): ReminderTime = kapan pengingat dikirim
-	// (RFC3339 +07:00, mis. 2026-07-01T15:00:00+07:00); ReminderNote = isi yang
-	// ingin diingatkan. Worker latar belakang menyuruh orchestrator menyampaikannya
-	// ke Pak Sudianto saat jatuh tempo.
-	ReminderTime string `json:"reminderTime,omitempty"`
-	ReminderNote string `json:"reminderNote,omitempty"`
-	// SEND_DOCUMENT (orchestrator/SU): agent menyusun SENDIRI isi laporan/dokumen
-	// (format & isi bebas, ditentukan Claude) lalu menyerahkannya ke gateway untuk
-	// dikemas jadi file & dikirim ke Pak Sudianto. Gateway tidak menyimpan template
-	// atau logika per-jenis-laporan — ia hanya menulis byte & mengirim.
-	//   DocFilename = nama file termasuk ekstensi (mis. "Laporan Juni.csv").
-	//   DocMime     = tipe konten (mis. "text/csv"); kosong → ditebak dari ekstensi.
-	//   DocEncoding = "utf8" (default, isi teks apa adanya) | "base64" (file biner).
-	//   DocContent  = isi file (teks mentah, atau base64 bila DocEncoding=base64).
-	//   DocCaption  = keterangan singkat yang menyertai lampiran (opsional).
+	// SET_REMINDER (orchestrator/SU): ReminderTime = waktu pengingat (RFC3339 +07:00,
+	// contoh: 2026-07-01T15:00:00+07:00). ReminderNote = isi pengingat. Worker menugaskan
+	// orchestrator untuk mengirim saat waktunya.
+	//
+	// Untuk pengingat BERULANG: RecurKind = "daily"|"weekly" (kosong/"none" = sekali).
+	// RecurTime = "HH:MM" WIB (untuk berulang). Jika "weekly", set RecurDow (0=Min..6=Sab).
+	// ReminderTime tetap menentukan kejadian pertama; sistem menjadwalkan berikutnya
+	// otomatis. ReminderLabel = referensi singkat untuk pembatalan.
+	ReminderTime  string `json:"reminderTime,omitempty"`
+	ReminderNote  string `json:"reminderNote,omitempty"`
+	RecurKind     string `json:"recurKind,omitempty"` // none|daily|weekly
+	RecurTime     string `json:"recurTime,omitempty"` // "HH:MM" WIB (berulang)
+	RecurDow      *int   `json:"recurDow,omitempty"`  // 0-6 (weekly)
+	ReminderLabel string `json:"reminderLabel,omitempty"`
+	// CANCEL_REMINDER (orchestrator/SU): ReminderID = id pengingat aktif (lihat snapshot)
+	// yang ingin dibatalkan. Untuk pengingat berulang, membatalkan menghentikan seluruh seri.
+	ReminderID int64 `json:"reminderId,omitempty"`
+	// SEND_DOCUMENT (orchestrator/SU): Agent menyediakan isi laporan/dokumen lalu
+	// gateway menulis file dan mengirim. Gateway tidak menyimpan template atau logika.
+	//   DocFilename = nama file dengan ekstensi (contoh: "Laporan Juni.csv").
+	//   DocMime = tipe konten (contoh: "text/csv"); kosong → deteksi dari ekstensi.
+	//   DocEncoding = "utf8" (default) | "base64" (biner).
+	//   DocContent = isi file (teks atau base64 jika encoding=base64).
+	//   DocCaption = keterangan lampiran (opsional).
 	DocFilename string `json:"docFilename,omitempty"`
 	DocMime     string `json:"docMime,omitempty"`
 	DocEncoding string `json:"docEncoding,omitempty"`
 	DocContent  string `json:"docContent,omitempty"`
 	DocCaption  string `json:"docCaption,omitempty"`
+	// UPDATE_AGENT_PERSONA (orchestrator/SU): Mengubah preferensi gaya ringan agent
+	// (nada, sapaan, formalitas, emoji, panjang jawaban, bahasa, dll.). Agent kirim
+	// PersonaText sebagai overlay penuh (mengganti overlay lama). Gateway menyimpan
+	// overlay sebagai konteks per giliran; aturan inti (SOUL.md), approval, dan keamanan
+	// tetap berlaku.
+	//   PersonaText = teks overlay (kosong = hapus preferensi kustom).
+	//   TargetAgent = agent tujuan (kosong → "orchestrator"; saat ini hanya itu).
+	PersonaText string `json:"personaText,omitempty"`
+	TargetAgent string `json:"targetAgent,omitempty"`
 }
 
 // Approval = satu pesan keluar yang ditahan menunggu persetujuan Pak Sudianto
@@ -439,6 +459,11 @@ type MeetingRequest struct {
 // Kind: "reminder" (diminta SU lewat SET_REMINDER) | "meeting_reminder" (otomatis
 // dibuat saat meeting dijadwalkan, beberapa menit sebelum mulai).
 // Status: pending | fired | cancelled | error.
+//
+// Pengingat BERULANG (RecurKind != "" / "none"): setelah baris ini berhasil fire,
+// sistem menyisipkan baris pending BARU untuk kejadian berikutnya (reschedule-on-fire)
+// — inilah jaminan keandalan seri walau LLM tak men-set ulang. RecurTime = jam-menit
+// WIB "HH:MM"; RecurDow (0-6) hanya untuk "weekly". Label = rujukan singkat untuk SU.
 type ScheduledTask struct {
 	ID        int64      `json:"id"`
 	FireAt    time.Time  `json:"fire_at"`
@@ -448,6 +473,10 @@ type ScheduledTask struct {
 	Status    string     `json:"status"`
 	CreatedBy string     `json:"created_by"`
 	ErrorText string     `json:"error_text,omitempty"`
+	RecurKind string     `json:"recur_kind,omitempty"` // none|daily|weekly
+	RecurTime string     `json:"recur_time,omitempty"` // "HH:MM" WIB
+	RecurDow  *int       `json:"recur_dow,omitempty"`  // 0-6 (weekly)
+	Label     string     `json:"label,omitempty"`
 	CreatedAt time.Time  `json:"created_at"`
 	FiredAt   *time.Time `json:"fired_at,omitempty"`
 }

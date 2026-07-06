@@ -42,6 +42,21 @@ func New(tenantID, clientID, clientSecret, userUPN, refreshToken, fromName, sign
 // Enabled true bila kredensial MS Graph lengkap.
 func (c *Client) Enabled() bool { return c != nil && c.enabled }
 
+// SendAlert mengirim email notifikasi alert (Fase M3b) langsung via MS Graph,
+// tanpa template meeting. Dipakai oleh webhook Alertmanager untuk memberi tahu
+// admin saat alert keamanan/kesehatan menyala. htmlBody sudah dirender pemanggil.
+func (c *Client) SendAlert(_ context.Context, to, toName, subject, htmlBody string) error {
+	if !c.Enabled() {
+		return fmt.Errorf("integrasi MS Graph nonaktif — email alert tidak dikirim")
+	}
+	return c.graph.SendMail(SendMailRequest{
+		To:       to,
+		ToName:   toName,
+		Subject:  subject,
+		HTMLBody: htmlBody,
+	})
+}
+
 // ListRecentEmails mengambil email inbox terbaru (untuk Email Watch). sinceISO opsional
 // (RFC3339 UTC) memfilter yang lebih baru; top membatasi jumlah. Mencoba izin aplikasi
 // dulu lalu fallback refresh token (lihat GraphClient.ListRecentMessages).

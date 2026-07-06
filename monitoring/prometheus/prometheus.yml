@@ -1,0 +1,64 @@
+# Prometheus — konfigurasi scrape (Fase M1 + M2 monitoring).
+# Gateway berjalan NATIVE di host Windows (bukan container), jadi diakses lewat
+# host.docker.internal. Postgres/Redis/container di-scrape lewat exporter (M2).
+# Exporter tak perlu port host: Prometheus menjangkaunya via nama service di
+# jaringan compose. windows_exporter WAJIB dipasang native di host Windows
+# (bukan container) dan mendengarkan di :9182 — lihat monitoring/README.md.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Alert rules (Fase M3).
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+# Kirim alert yang menyala ke Alertmanager (Fase M3b) → email via webhook gateway.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # Prometheus memantau dirinya sendiri.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # API Gateway PA AI (proses native di host, port 4000).
+  - job_name: api-gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:4000"]
+        labels:
+          service: api-gateway
+
+  # ─── Fase M2 — Infrastruktur ─────────────────────────────────
+  # Postgres (data KRITIS): koneksi, commit/rollback, ukuran DB, dsb.
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+        labels:
+          service: postgres
+
+  # Redis: klien, memori, ops/detik, hit/miss.
+  - job_name: redis
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+        labels:
+          service: redis
+
+  # cAdvisor: CPU/memori/IO PER-CONTAINER (best-effort di Docker Desktop/WSL2).
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+        labels:
+          service: cadvisor
+
+  # windows_exporter: CPU/RAM/disk FISIK host Windows. Dipasang native di host
+  # (service Windows), BUKAN container. Jika belum terpasang, target ini "down"
+  # tanpa mengganggu yang lain.
+  - job_name: windows-host
+    static_configs:
+      - targets: ["host.docker.internal:9182"]
+        labels:
+          service: windows-host

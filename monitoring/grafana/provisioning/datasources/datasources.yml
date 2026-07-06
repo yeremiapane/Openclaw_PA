@@ -1,0 +1,29 @@
+# Provisioning datasource Grafana (Fase M1).
+# Dua sumber: Prometheus (metrik operasional/infrastruktur) & Postgres (telemetri
+# agent/biaya yang SUDAH tercatat gateway di tabel agent_executions dkk).
+# Nilai ${PA_DB_*} diisi dari environment container grafana (lihat docker-compose).
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+
+  - name: PA Postgres
+    uid: pa_postgres
+    type: postgres
+    access: proxy
+    url: ${PA_DB_HOST}
+    database: ${PA_DB_NAME}
+    user: ${PA_DB_USER}
+    secureJsonData:
+      password: ${PA_DB_PASS}
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false
+    editable: false

@@ -11,20 +11,13 @@ import (
 	"pa-ai/api-gateway/src/model"
 )
 
-// maxDocBytes membatasi ukuran dokumen (setelah decode) agar payload turn agent &
-// pengiriman WAHA tetap wajar. Cukup besar untuk laporan teks/PDF ringkas, cukup
-// kecil untuk mencegah penyalahgunaan memori.
+// Batas ukuran dokumen setelah decode.
 const maxDocBytes = 8 << 20 // 8 MiB
 
-// sendDocument menjalankan action SEND_DOCUMENT: agent (lewat orchestrator) telah
-// MENYUSUN SENDIRI isi sebuah laporan/dokumen (format & isi sepenuhnya ditentukan
-// Claude). Gateway hanya MENGEMAS isi itu menjadi berkas lalu mengirimnya ke Pak
-// Sudianto via WAHA. Gateway sengaja TIDAK memuat template atau logika per-jenis
-// laporan — itu di luar tanggung jawabnya.
+// sendDocument menangani SEND_DOCUMENT: isi dokumen disusun oleh agent, lalu gateway
+// membungkusnya menjadi file dan mengirimkannya via WAHA.
 //
-// Keamanan: hanya percakapan ber-trust 'su' yang boleh memicu (gerbang sama seperti
-// pengingat). Dokumen hanya dikirim ke SU; pengiriman ke pihak eksternal (yang akan
-// melewati approval gate) bukan cakupan langkah ini.
+// Hanya percakapan ber-trust 'su' yang boleh memicu. Pengiriman hanya ke SU.
 func (h *Handler) sendDocument(ctx context.Context, convID string, initiator *model.Contact, a model.Action, execID int64) {
 	if initiator == nil || initiator.TrustLevel != "su" {
 		trust := "(nil)"

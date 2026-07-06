@@ -17,20 +17,17 @@ import (
 // untuk "laporkan bila ada email" tanpa membebani Graph/kuota. Hanya menarik email BARU.
 const emailWatchPoll = 3 * time.Minute
 
-// emailFetchTop = jumlah email inbox terbaru yang ditarik per ronde. Cukup besar untuk
-// mailbox sibuk normal; bila email baru > angka ini dalam satu jeda, yang terlama terlewat
-// (trade-off sadar untuk MVP — volume rendah).
+// emailFetchTop = jumlah email terbaru per ronde (25).
 const emailFetchTop = 25
 
 // maxWatchCandidates = batas email kandidat yang disodorkan ke orchestrator per pantauan
 // per ronde, menjaga ukuran prompt & biaya token.
 const maxWatchCandidates = 8
 
-// StartEmailWatcher menjalankan worker latar belakang yang memeriksa inbox PA secara
-// berkala untuk Email Watch. Untuk tiap pantauan aktif milik SU, email baru yang lolos
-// pra-saring dinilai oleh orchestrator; yang cocok dilaporkan proaktif ke SU. State
-// (last_seen_at) tersimpan di Postgres sehingga aman terhadap restart. Nonaktif bila SU
-// phone kosong atau integrasi Graph tak aktif.
+// StartEmailWatcher menjalankan worker background yang berkala memeriksa inbox PA
+// untuk Email Watch. Email baru yang lolos pra-saring dinilai oleh orchestrator dan
+// yang cocok dilaporkan ke SU. State (last_seen_at) disimpan di Postgres. Tidak
+// dijalankan jika SU phone kosong atau integrasi Graph mati.
 func (h *Handler) StartEmailWatcher(ctx context.Context) {
 	if h.SUPhone == "" {
 		log.Printf("[EMAILWATCH] SU phone kosong — worker pantauan email TIDAK dijalankan")
@@ -98,10 +95,8 @@ func (h *Handler) runEmailWatches(ctx context.Context) {
 	}
 }
 
-// buildSentIndex menarik email terkirim sejak sinceISO dan memetakan conversationId ke
-// waktu kirim TERBARU. Kembalian kedua = false bila penarikan gagal (status balasan tak
-// diketahui). since = last_seen tertua, jadi rentang ini pasti mencakup balasan apa pun
-// atas email yang baru dinilai (balasan selalu setelah email masuk, yang > last_seen).
+// buildSentIndex menarik email terkirim dan memetakan conversationId ke waktu kirim terbaru.
+// Mengembalikan false jika penarikan gagal (status balasan tidak diketahui).
 func (h *Handler) buildSentIndex(ctx context.Context, sinceISO string) (map[string]time.Time, bool) {
 	sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	sent, err := h.Services.ListSentReplies(sctx, sinceISO, emailFetchTop*2)
@@ -187,10 +182,10 @@ func (h *Handler) evaluateWatch(ctx context.Context, w model.EmailWatch, emails 
 	}
 }
 
-// emailPassesPrefilter menerapkan pra-saring MURAH (tanpa LLM): bila FromFilter diisi,
-// email harus dari pengirim yang cocok; bila KeywordFilter diisi, subjek/cuplikan harus
-// mengandung salah satu kata kunci. Keduanya kosong → semua email baru jadi kandidat.
-// Case-insensitive; KeywordFilter dipisah koma (OR).
+// emailPassesPrefilter: pra-saring sederhana (tanpa LLM).
+// - FromFilter: cocokkan pengirim bila diisi.
+// - KeywordFilter: cocokkan subjek/cuplikan (kata kunci dipisah koma, OR).
+// Case-insensitive. Kosongkan kedua filter → terima semua.
 func emailPassesPrefilter(e services.EmailMessage, w model.EmailWatch) bool {
 	if f := strings.ToLower(strings.TrimSpace(w.FromFilter)); f != "" {
 		hay := strings.ToLower(e.FromAddress + " " + e.FromName)
@@ -215,10 +210,9 @@ func emailPassesPrefilter(e services.EmailMessage, w model.EmailWatch) bool {
 	return true
 }
 
-// buildEmailWatchInstruction menyusun instruksi (giliran sistem) untuk orchestrator: nilai
-// apakah ada email kandidat yang cocok dengan kriteria pantauan, lalu laporkan yang cocok ke
-// SU — atau DIAM (balas kosong) bila tak ada yang cocok. Isi email diperlakukan sebagai DATA
-// tak tepercaya (pertahanan prompt-injection).
+// buildEmailWatchInstruction menyusun instruksi sistem untuk menilai apakah ada email yang
+// cocok dengan kriteria pantauan. Isi email diperlakukan sebagai data tak tepercaya untuk
+// mencegah prompt-injection.
 func buildEmailWatchInstruction(w model.EmailWatch, emails []services.EmailMessage, sentIdx map[string]time.Time, sentKnown bool) string {
 	var b strings.Builder
 	b.WriteString("[PANTAUAN EMAIL — giliran sistem, BUKAN pesan dari Pak Sudianto]\n")
@@ -302,21 +296,15 @@ func parseEmailTime(s string) time.Time {
 }
 
 // readEmailsTop = jumlah email inbox terbaru yang ditarik untuk permintaan cek on-demand
-// (READ_EMAILS). Lebih besar dari maxWatchCandidates karena di sini kita menyaring dulu
-// (belum dibaca / belum dibalas) sebelum membatasi jumlah yang dilaporkan.
+// (READ_EMAILS).
 const readEmailsTop = 25
 
 // maxReadResults = batas email yang disodorkan ke orchestrator per permintaan cek on-demand,
 // menjaga ukuran prompt & biaya token.
 const maxReadResults = 10
 
-// readEmails menjalankan action READ_EMAILS: SU (lewat orchestrator) minta pengecekan inbox
-// SAAT ITU JUGA (on-demand) — berbeda dari WATCH_EMAIL yang proaktif. Alurnya: tarik email
-// terbaru, saring sesuai scope (belum dibaca / belum dibalas / semua) + filter opsional,
-// lalu SUNTIK hasilnya BALIK ke orchestrator (pushToOrchestrator) untuk disusun jadi laporan
-// rapi ke SU. Selalu memberi jawaban (termasuk "tidak ada"). Hanya inisiator ber-trust 'su'
-// (gerbang keamanan — agar agent/kontak lain tak bisa mengintip inbox SU). Dijalankan di
-// goroutine oleh pemanggil karena penarikan Graph + giliran LLM bisa lama.
+// readEmails melakukan pengecekan inbox on-demand oleh SU: tarik email terbaru, saring sesuai scope,
+// kirim hasil ke orchestrator. Hanya SU (trust='su') yang bisa memicu. Dijalankan di goroutine.
 func (h *Handler) readEmails(initiator *model.Contact, a model.Action) {
 	if initiator == nil || initiator.TrustLevel != "su" {
 		trust := "(nil)"
@@ -391,8 +379,7 @@ func (h *Handler) readEmails(initiator *model.Contact, a model.Action) {
 }
 
 // pushEmailReadResult menyuntik instruksi hasil cek email ke orchestrator agar disampaikan
-// ke SU. Bungkus tipis di atas pushToOrchestrator dengan penanganan log yang sesuai untuk
-// jalur on-demand (di sini balasan kosong = anomali, sebab kita selalu minta jawaban).
+// ke SU.
 func (h *Handler) pushEmailReadResult(ctx context.Context, instruction string) {
 	if err := h.pushToOrchestrator(ctx, instruction, time.Time{}); err != nil {
 		log.Printf("[EMAILREAD] sampaikan hasil ke SU gagal: %v", err)
@@ -401,10 +388,9 @@ func (h *Handler) pushEmailReadResult(ctx context.Context, instruction string) {
 	log.Printf("[EMAILREAD] hasil cek email disampaikan ke SU")
 }
 
-// buildEmailReadInstruction menyusun instruksi (giliran sistem) untuk orchestrator agar
-// merangkum hasil cek inbox on-demand ke SU. Berbeda dari pantauan proaktif, di sini
-// orchestrator SELALU membalas: bila daftar kosong, sampaikan sopan bahwa tak ada yang
-// cocok. Isi email diperlakukan sebagai DATA tak tepercaya (pertahanan prompt-injection).
+// buildEmailReadInstruction membuat instruksi (giliran sistem) untuk orchestrator
+// agar merangkum hasil cek inbox on-demand untuk SU. Orchestrator selalu membalas
+// (sebutkan bila kosong). Anggap teks email sebagai DATA tidak tepercaya.
 func buildEmailReadInstruction(scope string, pf model.EmailWatch, emails []services.EmailMessage, sentIdx map[string]time.Time, sentKnown bool) string {
 	var b strings.Builder
 	b.WriteString("[HASIL CEK EMAIL — giliran sistem, BUKAN pesan dari Pak Sudianto]\n")
@@ -486,10 +472,8 @@ func describeReadScope(scope string, pf model.EmailWatch) string {
 	return strings.Join(parts, ", ")
 }
 
-// watchEmail menjalankan action WATCH_EMAIL: SU (lewat orchestrator) minta pemantauan
-// inbox dengan kriteria bahasa alami. Hanya inisiator ber-trust 'su' (gerbang keamanan —
-// agar agent/kontak lain tak bisa memantau inbox SU). Disimpan sebagai email_watches
-// created_by='su'. Pra-saring (from/keyword) opsional untuk menghemat token.
+	// watchEmail menjalankan action WATCH_EMAIL dengan kriteria bahasa alami.
+	// Hanya untuk inisiator dengan trust level 'su'. Disimpan sebagai email_watches.
 func (h *Handler) watchEmail(ctx context.Context, initiator *model.Contact, a model.Action) {
 	if initiator == nil || initiator.TrustLevel != "su" {
 		trust := "(nil)"
@@ -532,9 +516,7 @@ func (h *Handler) watchEmail(ctx context.Context, initiator *model.Contact, a mo
 	log.Printf("[EMAILWATCH] pantauan #%d dibuat: %q (from=%q kw=%q)", id, criteria, a.WatchFrom, a.WatchKeyword)
 }
 
-// cancelWatch menjalankan action CANCEL_WATCH: SU (lewat orchestrator) menghentikan sebuah
-// pantauan email aktif berdasarkan watchId (dari snapshot [PANTAUAN EMAIL AKTIF]). Gerbang
-// ganda: inisiator harus ber-trust 'su' DAN CancelEmailWatch hanya menyentuh created_by='su'.
+// cancelWatch menghentikan pantauan email aktif (hanya untuk SU dengan trust level 'su').
 func (h *Handler) cancelWatch(ctx context.Context, initiator *model.Contact, a model.Action) {
 	if initiator == nil || initiator.TrustLevel != "su" {
 		trust := "(nil)"
@@ -560,9 +542,7 @@ func (h *Handler) cancelWatch(ctx context.Context, initiator *model.Contact, a m
 	log.Printf("[EMAILWATCH] pantauan #%d dihentikan", a.WatchID)
 }
 
-// buildWatchSnapshot merakit ringkasan pantauan email AKTIF milik SU langsung dari
-// PostgreSQL untuk disisipkan ke konteks orchestrator — sehingga SU bisa menanyakan &
-// menghentikannya (CANCEL_WATCH) tanpa action LIST khusus. "" bila tak ada pantauan.
+// buildWatchSnapshot merakit ringkasan pantauan email SU untuk konteks orchestrator.
 func (h *Handler) buildWatchSnapshot(ctx context.Context) string {
 	if h.Store == nil {
 		return ""

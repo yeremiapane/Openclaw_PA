@@ -478,17 +478,9 @@ type MeetingRequest struct {
 	ScheduledAt      *time.Time      `json:"scheduled_at,omitempty"`
 }
 
-// ScheduledTask = satu tugas terjadwal (pengingat) yang akan dijalankan worker
-// latar belakang saat FireAt tercapai. Pada saat itu, orchestrator disuruh
-// menyusun & mengirim pesan pengingat ke Pak Sudianto (push proaktif).
-// Kind: "reminder" (diminta SU lewat SET_REMINDER) | "meeting_reminder" (otomatis
-// dibuat saat meeting dijadwalkan, beberapa menit sebelum mulai).
-// Status: pending | fired | cancelled | error.
-//
-// Pengingat BERULANG (RecurKind != "" / "none"): setelah baris ini berhasil fire,
-// sistem menyisipkan baris pending BARU untuk kejadian berikutnya (reschedule-on-fire)
-// — inilah jaminan keandalan seri walau LLM tak men-set ulang. RecurTime = jam-menit
-// WIB "HH:MM"; RecurDow (0-6) hanya untuk "weekly". Label = rujukan singkat untuk SU.
+// ScheduledTask = tugas pengingat terjadwal yang dijalankan saat FireAt tercapai.
+// Kind: "reminder" | "meeting_reminder". Status: pending | fired | cancelled | error.
+// Pengingat berulang akan dijadwalkan ulang setelah task fire.
 type ScheduledTask struct {
 	ID        int64      `json:"id"`
 	FireAt    time.Time  `json:"fire_at"`
@@ -506,11 +498,9 @@ type ScheduledTask struct {
 	FiredAt   *time.Time `json:"fired_at,omitempty"`
 }
 
-// EmailWatch = satu permintaan pemantauan email (Email Watch). SU meminta agent
-// MELAPOR proaktif bila ada email masuk yang cocok dengan Criteria (bahasa alami).
-// FromFilter/KeywordFilter = pra-saring murah (opsional) agar hanya kandidat relevan
-// yang dinilai LLM. LastSeenAt = batas bawah waktu email yang dinilai (maju tiap ronde,
-// sehingga tiap email dievaluasi tepat sekali). Status: active|cancelled|expired.
+// EmailWatch = permintaan pemantauan email. Agent melaporkan email yang cocok
+// dengan Criteria. FromFilter/KeywordFilter = pra-saring opsional. LastSeenAt
+// adalah batas bawah waktu untuk evaluasi (maju tiap ronde). Status: active|cancelled|expired.
 type EmailWatch struct {
 	ID            int64      `json:"id"`
 	Criteria      string     `json:"criteria"`

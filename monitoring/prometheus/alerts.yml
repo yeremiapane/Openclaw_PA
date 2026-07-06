@@ -1,0 +1,55 @@
+# Alert rules Prometheus (Fase M3 — Keamanan & kesehatan dasar).
+# Tampil di Prometheus UI (tab Alerts). Pengiriman notifikasi (mis. WhatsApp ke SU)
+# lewat Alertmanager menyusul di M3b — lihat monitoring/README.md.
+groups:
+  - name: keamanan
+    rules:
+      - alert: LonjakanInjeksiPrompt
+        expr: sum(increase(gateway_security_events_total{kind="injection_blocked"}[5m])) > 3
+        for: 0m
+        labels: { severity: warning, pilar: keamanan }
+        annotations:
+          summary: "Lonjakan prompt-injection diblokir"
+          description: ">3 upaya injeksi diblokir dalam 5 menit terakhir."
+
+      - alert: LonjakanBlokirWhitelist
+        expr: sum(increase(gateway_security_events_total{kind=~"whitelist_blocked|external_blocked"}[10m])) > 10
+        for: 0m
+        labels: { severity: warning, pilar: keamanan }
+        annotations:
+          summary: "Banyak pesan dari nomor tak dikenal"
+          description: ">10 pesan diblokir whitelist dalam 10 menit (kemungkinan probing/spam)."
+
+      - alert: GagalAuthAdmin
+        expr: sum(increase(gateway_security_events_total{kind="admin_auth_failed"}[5m])) > 0
+        for: 0m
+        labels: { severity: critical, pilar: keamanan }
+        annotations:
+          summary: "Percobaan akses admin gagal"
+          description: "Ada request ke /admin/* dengan X-Admin-Key salah/absen."
+
+  - name: kesehatan
+    rules:
+      - alert: GatewayDown
+        expr: up{job="api-gateway"} == 0
+        for: 1m
+        labels: { severity: critical, pilar: infra }
+        annotations:
+          summary: "API Gateway tidak ter-scrape"
+          description: "Target api-gateway down >1 menit (proses native mati / port 4000 tak dijangkau)."
+
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels: { severity: critical, pilar: infra }
+        annotations:
+          summary: "Postgres down (DATA KRITIS)"
+          description: "postgres_exporter melaporkan pg_up=0 >1 menit."
+
+      - alert: ErrorRate5xxTinggi
+        expr: 100 * sum(rate(gateway_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(gateway_http_requests_total[5m])), 1) > 5
+        for: 5m
+        labels: { severity: warning, pilar: api }
+        annotations:
+          summary: "Error rate 5xx > 5%"
+          description: "Gateway mengembalikan >5% error 5xx selama 5 menit."

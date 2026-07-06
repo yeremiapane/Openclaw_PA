@@ -22,7 +22,7 @@ import (
 // Kunci context yang dibagikan antar middleware & handler.
 const (
 	CtxEvent   = "waha_event" // *model.WahaEvent
-	CtxContact = "contact"    // *model.Contact 
+	CtxContact = "contact"    // *model.Contact
 	CtxText    = "clean_text" // string
 )
 
@@ -122,6 +122,11 @@ func Auth(store *db.Store, lids LidResolver) gin.HandlerFunc {
 				Identifier: ev.Payload.From, Kind: id.Kind, Phone: phoneOf(id),
 				Decision: "blocked", Reason: reason, BodyPreview: bodyPreview(ev.Payload.Body),
 			})
+			if reason == "external_blocked" {
+				SecurityEvent("external_blocked")
+			} else {
+				SecurityEvent("whitelist_blocked")
+			}
 			log.Printf("[BLOCKED] from=%s (%s:%s) reason=%s", ev.Payload.From, id.Kind, id.Value, reason)
 			c.AbortWithStatusJSON(http.StatusOK, gin.H{"status": "blocked"})
 			return
@@ -157,6 +162,7 @@ func RateLimit(limiter *db.RateLimiter, store *db.Store) gin.HandlerFunc {
 				Phone: contact.Phone, ContactID: &cid, Decision: "rate_limited",
 				BodyPreview: bodyPreview(ev.Payload.Body),
 			})
+			SecurityEvent("rate_limited")
 			log.Printf("[RATE LIMITED] phone=%s count=%d", contact.Phone, count)
 			c.AbortWithStatusJSON(http.StatusOK, gin.H{"status": "rate_limited"})
 			return
@@ -204,6 +210,7 @@ func Sanitize(maxLen int, store *db.Store) gin.HandlerFunc {
 					Phone: contact.Phone, ContactID: &cid, Decision: "injection_blocked",
 					Reason: re.String(), BodyPreview: bodyPreview(text),
 				})
+				SecurityEvent("injection_blocked")
 				log.Printf("[INJECTION BLOCKED] phone=%s pola=%q", contact.Phone, re.String())
 				c.AbortWithStatusJSON(http.StatusOK, gin.H{"status": "blocked_injection"})
 				return
@@ -230,6 +237,7 @@ func AdminAuth(adminKey string) gin.HandlerFunc {
 		}
 		got := c.GetHeader("X-Admin-Key")
 		if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(adminKey)) != 1 {
+			SecurityEvent("admin_auth_failed")
 			log.Printf("[ADMIN] akses ditolak dari %s ke %s", c.ClientIP(), c.Request.URL.Path)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 			return

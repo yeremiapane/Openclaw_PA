@@ -66,7 +66,7 @@ func main() {
 		cfg.MSGraphUserUPN, cfg.MSGraphRefreshToken, cfg.MailFromName, cfg.SignaturePath,
 	)
 
-	h := &routes.Handler{Waha: wahaClient, Store: store, OpenClaw: openClawClient, Memory: mem, Services: svcClient, SUPhone: cfg.SUPhone, NovaPhone: cfg.NovaPhone, ReminderLeadMinutes: cfg.ReminderLeadMinutes}
+	h := &routes.Handler{Waha: wahaClient, Store: store, OpenClaw: openClawClient, Memory: mem, Services: svcClient, SUPhone: cfg.SUPhone, NovaPhone: cfg.NovaPhone, ReminderLeadMinutes: cfg.ReminderLeadMinutes, AlertEmailTo: cfg.AlertEmailTo, AlertWebhookToken: cfg.AlertWebhookToken}
 	admin := &routes.AdminHandler{Store: store, Gateway: h}
 
 	// --- Worker pengingat (Fase A): kirim tugas terjadwal ke SU saat jatuh tempo ---
@@ -76,6 +76,11 @@ func main() {
 	h.StartEmailWatcher(ctx)
 
 	r := gin.Default()
+
+	// Instrumentasi Prometheus (Fase M1): catat jumlah & durasi tiap request, lalu
+	// ekspos di /metrics untuk di-scrape. Dipasang paling awal agar semua rute tercakup.
+	r.Use(middleware.Metrics())
+	r.GET("/metrics", middleware.MetricsHandler())
 
 	r.GET("/health", func(c *gin.Context) {
 		status, err := wahaClient.SessionStatus()
@@ -102,6 +107,10 @@ func main() {
 		// openclaw-output adalah jalur internal (bukan dari WhatsApp), tanpa chain WA.
 		webhook.POST("/openclaw-output", h.OpenClawOutput)
 	}
+
+	// Webhook Alertmanager (Fase M3b): relay alert -> email. Auth Bearer token
+	// sendiri (ALERT_WEBHOOK_TOKEN), bukan X-Admin-Key. Nonaktif bila token kosong.
+	r.POST("/internal/alerts", h.AlertWebhook)
 
 	// Admin API (kelola whitelist, pantau external & audit log) — wajib X-Admin-Key.
 	adminGrp := r.Group("/admin", middleware.AdminAuth(cfg.AdminAPIKey))

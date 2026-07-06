@@ -76,9 +76,7 @@ func detectScript(bin string) string {
 	return ""
 }
 
-// AgentReply adalah kontrak output PA Communicator (didefinisikan di SOUL.md).
-// Agent mengeluarkan objek JSON ini, dibungkus markdown fence ```json di dalam
-// payload teks CLI.
+// AgentReply adalah kontrak output PA Communicator (JSON dibungkus markdown fence).
 type AgentReply struct {
 	Response         string         `json:"response"`
 	Actions          []model.Action `json:"actions"`
@@ -88,10 +86,8 @@ type AgentReply struct {
 	Meeting          *MeetingInfo   `json:"meeting,omitempty"`
 }
 
-// MeetingInfo = detail jadwal terstruktur yang diisi agent saat menyepakati
-// pertemuan. Dipakai gateway untuk membuat event Calendar + RSVP email
-// otomatis ketika SU menyetujui. Semua field opsional; tanpa Datetime valid,
-// gateway hanya menyimpan meeting tanpa menjadwalkan.
+// MeetingInfo = detail jadwal terstruktur untuk Calendar + RSVP email.
+// Semua field opsional; tanpa Datetime valid, meeting hanya disimpan.
 type MeetingInfo struct {
 	Title           string `json:"title,omitempty"`
 	Datetime        string `json:"datetime,omitempty"` // RFC3339, mis. 2026-06-26T10:00:00+07:00
@@ -116,9 +112,7 @@ type Usage struct {
 // Total menjumlahkan semua komponen token.
 func (u Usage) Total() int { return u.Input + u.Output + u.CacheRead + u.CacheWrite }
 
-// RunMeta = metadata observability satu giliran agent (Fase 8.5), diekstrak dari
-// envelope CLI. Tersedia meski kontrak JSON agent gagal di-parse atau agent diam,
-// agar gateway tetap dapat mencatat token/model/durasi untuk evaluasi.
+// RunMeta menyimpan metadata observability satu giliran agent.
 type RunMeta struct {
 	RunID             string
 	Status            string
@@ -139,9 +133,9 @@ type RunMeta struct {
 }
 
 type meta struct {
-	DurationMs                int             `json:"durationMs"`
-	FinalAssistantVisibleText string          `json:"finalAssistantVisibleText"`
-	FinalAssistantRawText     string          `json:"finalAssistantRawText"`
+	DurationMs                int    `json:"durationMs"`
+	FinalAssistantVisibleText string `json:"finalAssistantVisibleText"`
+	FinalAssistantRawText     string `json:"finalAssistantRawText"`
 	Completion                struct {
 		FinishReason string `json:"finishReason"`
 		StopReason   string `json:"stopReason"`
@@ -221,13 +215,13 @@ func (e *envelope) runMeta() *RunMeta {
 		Runner:            m.ExecutionTrace.Runner,
 	}
 	rm.ExecutionTrace, _ = json.Marshal(map[string]any{
-		"winnerProvider": m.ExecutionTrace.WinnerProvider,
-		"winnerModel":    m.ExecutionTrace.WinnerModel,
-		"fallbackUsed":   m.ExecutionTrace.FallbackUsed,
-		"runner":         m.ExecutionTrace.Runner,
+		"winnerProvider":    m.ExecutionTrace.WinnerProvider,
+		"winnerModel":       m.ExecutionTrace.WinnerModel,
+		"fallbackUsed":      m.ExecutionTrace.FallbackUsed,
+		"runner":            m.ExecutionTrace.Runner,
 		"systemPromptChars": spr.SystemPrompt.Chars,
-		"promptChars":    spr.CurrentTurn.PromptChars,
-		"sessionKey":     spr.SessionKey,
+		"promptChars":       spr.CurrentTurn.PromptChars,
+		"sessionKey":        spr.SessionKey,
 	})
 	return rm
 }
@@ -248,12 +242,8 @@ func (c *Client) Inject(ctx context.Context, sessionKey, message string) (*Agent
 	return c.InjectAgent(ctx, c.agentID, sessionKey, message)
 }
 
-// InjectAgent menjalankan satu turn untuk agent tertentu (Fase 8 routing:
-// orchestrator / support / pa_communicator). agentID kosong → pakai default client.
-//
-// Mengembalikan juga *RunMeta (token usage, model, durasi, trace) yang TETAP terisi
-// meski kontrak JSON agent gagal di-parse atau agent diam — agar gateway dapat
-// mencatat setiap giliran untuk evaluasi. RunMeta tidak pernah nil.
+// InjectAgent menjalankan satu turn untuk agent tertentu. agentID kosong memakai default client.
+// Mengembalikan *RunMeta yang tetap terisi meski parse gagal atau output kosong.
 func (c *Client) InjectAgent(ctx context.Context, agentID, sessionKey, message string) (*AgentReply, *RunMeta, error) {
 	if agentID == "" {
 		agentID = c.agentID

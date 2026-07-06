@@ -99,3 +99,104 @@ services:
       MS_GRAPH_USER_UPN: ${MS_GRAPH_USER_UPN}
       FROM_NAME: "PA Asisten"
     restart: unless-stopped
+
+  # ─── Monitoring (Fase M1) ──────────────────────────────────
+  # Gateway berjalan NATIVE di host (port 4000); Prometheus men-scrape-nya lewat
+  # host.docker.internal. Port host memakai rentang 1xxxx agar tak bentrok dengan
+  # rentang reserved WinNAT (alasan sama seperti WAHA di :13000).
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: pa_ai_prometheus
+    ports:
+      - "19090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ./data/prometheus:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - alertmanager
+    restart: unless-stopped
+
+  # Alertmanager (Fase M3b): terima alert dari Prometheus, kirim email lewat
+  # webhook gateway (/internal/alerts). Token Bearer dibaca dari file webhook_token
+  # (ter-gitignore) — isinya = ALERT_WEBHOOK_TOKEN. Lihat monitoring/README.md.
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: pa_ai_alertmanager
+    ports:
+      - "19093:9093"
+    volumes:
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./monitoring/alertmanager/webhook_token:/etc/alertmanager/webhook_token:ro
+      - ./data/alertmanager:/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: pa_ai_grafana
+    ports:
+      - "13001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Dipakai provisioning datasource Postgres (monitoring/grafana/provisioning).
+      PA_DB_HOST: postgres:5432
+      PA_DB_NAME: pa_ai
+      PA_DB_USER: pa_ai
+      PA_DB_PASS: ${DB_PASS}
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./data/grafana:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - postgres
+    restart: unless-stopped
+
+  # ─── Monitoring exporters (Fase M2 — Infrastruktur) ────────
+  # Exporter TIDAK meng-expose port ke host: Prometheus menjangkaunya lewat
+  # nama service di jaringan compose (lebih kecil permukaan serangannya).
+  # CPU/RAM FISIK host Windows dipantau windows_exporter yang dipasang NATIVE
+  # di host (bukan di sini) — lihat monitoring/README.md.
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: pa_ai_postgres_exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://pa_ai:${DB_PASS}@postgres:5432/pa_ai?sslmode=disable"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    container_name: pa_ai_redis_exporter
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: pa_ai_cadvisor
+    # Metrik per-container. Di Docker Desktop/WSL2 sifatnya best-effort; jika
+    # container gagal start, hentikan saja — dashboard host & DB tetap jalan.
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    restart: unless-stopped

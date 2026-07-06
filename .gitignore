@@ -6,6 +6,9 @@
 /data/
 /.waha/
 
+# Alertmanager webhook Bearer token (secret; isi = ALERT_WEBHOOK_TOKEN)
+/monitoring/alertmanager/webhook_token
+
 # OpenClaw runtime (keep agents/ & workspace/ tracked, ignore caches)
 /.openclaw/cache/
 /.openclaw/logs/

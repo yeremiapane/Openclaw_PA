@@ -41,6 +41,10 @@ type Config struct {
 	MaxMsgLen       int           // batas panjang body pesan
 	AdminAPIKey     string        // melindungi endpoint /admin/*
 
+	// Alerting (Fase M3b): Alertmanager -> webhook gateway -> email via MS Graph.
+	AlertEmailTo      string // tujuan notifikasi alert keamanan/kesehatan
+	AlertWebhookToken string // Bearer token untuk POST /internal/alerts (kosong = endpoint nonaktif)
+
 	// Kontak trusted untuk seed whitelist
 	SUPhone   string
 	SULid     string
@@ -109,6 +113,9 @@ func Load() Config {
 		RateLimitWindow: time.Duration(getenvInt("RATE_LIMIT_WINDOW_SEC", 60)) * time.Second,
 		MaxMsgLen:       getenvInt("MAX_MSG_LEN", 2000),
 		AdminAPIKey:     getenv("ADMIN_API_KEY", ""),
+
+		AlertEmailTo:      getenv("ALERT_EMAIL_TO", "yeremia.yosefan@hypernet.co.id"),
+		AlertWebhookToken: getenv("ALERT_WEBHOOK_TOKEN", ""),
 
 		SUPhone:   getenv("SU_PHONE", ""),
 		SULid:     getenv("SU_LID", ""),

@@ -2,6 +2,7 @@ package routes
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"pa-ai/api-gateway/src/db"
 	"pa-ai/api-gateway/src/model"
 	"pa-ai/api-gateway/src/openclaw"
+	"pa-ai/api-gateway/src/services"
 )
 
 // schedulerPoll = jeda antar pemeriksaan tugas terjadwal. 30 dtk: cukup halus untuk
@@ -80,7 +82,19 @@ func (h *Handler) fireTask(ctx context.Context, task model.ScheduledTask) {
 	fctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
-	err := h.pushToOrchestrator(fctx, buildReminderInstruction(task), task.FireAt)
+	// Instruksi default = pengingat statis. Untuk DIGEST KALENDER, tarik agenda hari
+	// ini langsung dari kalender PA lalu minta orchestrator menyusun ringkasan + rencana.
+	instruction := buildReminderInstruction(task)
+	if task.Kind == "calendar_digest" {
+		instruction = h.buildCalendarDigestInstruction(fctx, task)
+	}
+	err := h.pushToOrchestrator(fctx, instruction, task.FireAt)
+
+	// Pengingat MEETING juga dikirim ke pihak EKSTERNAL via WhatsApp (bila ada chat
+	// eksternal). SU sudah dapat push di atas; ini melengkapi agar kedua pihak diingatkan.
+	if task.Kind == "meeting_reminder" && task.MeetingID != nil {
+		h.remindExternalForMeeting(fctx, *task.MeetingID, task.FireAt)
+	}
 
 	// Reschedule-on-fire: untuk pengingat BERULANG, jadwalkan kejadian berikutnya
 	// sekarang (idempoten — ClaimDueTasks memfire tiap baris tepat sekali). INILAH
@@ -250,6 +264,9 @@ func (h *Handler) pushToOrchestrator(ctx context.Context, task string, releaseAt
 			if snap := h.buildReminderSnapshot(ctx); snap != "" {
 				mc.LiveStatus += "\n\n" + snap
 			}
+			if snap := h.buildWatchSnapshot(ctx); snap != "" {
+				mc.LiveStatus += "\n\n" + snap
+			}
 			if snap := h.buildPersonaSnapshot(ctx); snap != "" {
 				mc.LiveStatus += "\n\n" + snap
 			}
@@ -384,6 +401,70 @@ func buildMeetingReminderNote(title, who string, m *model.MeetingRequest, det me
 	return b.String()
 }
 
+// remindExternalForMeeting mengirim pengingat meeting ke pihak EKSTERNAL via WhatsApp,
+// melengkapi push pengingat ke SU. Pesan bersifat template (deterministik, tanpa LLM) agar
+// andal. Menahan sampai releaseAt lalu kirim ke chat eksternal. No-op bila meeting tidak
+// ditemukan, sudah lewat, atau tak punya chat eksternal.
+func (h *Handler) remindExternalForMeeting(ctx context.Context, meetingID int64, releaseAt time.Time) {
+	if h.Store == nil {
+		return
+	}
+	m, err := h.Store.MeetingByID(ctx, meetingID)
+	if err != nil || m == nil || m.ProposedDatetime == nil {
+		return
+	}
+	// Jangan ingatkan meeting yang sudah dibatalkan.
+	if m.Status == "cancelled" || m.Status == "rejected" {
+		return
+	}
+	chat := h.externalChatIDForMeeting(ctx, m)
+	if chat == "" {
+		return
+	}
+	var det meetingDetails
+	_ = json.Unmarshal(m.Details, &det)
+	title := firstNonEmptyStr(det.Title, m.Topic, "meeting")
+	who := firstNonEmptyStr(det.AttendeeName, m.ExternalName, "")
+	msg := buildExternalReminderText(who, title, m, det, h.reminderLead())
+
+	// Tahan sampai tepat waktu (push SU di atas sudah menahan; ini pengaman bila push SU
+	// gagal lebih awal sebelum sempat menahan).
+	if err := holdUntil(ctx, releaseAt); err != nil {
+		return
+	}
+	agentID := firstNonEmptyStr(m.AgentID, "pa_communicator")
+	h.sendAndRecord(ctx, func() error { return h.Waha.SendToChat(chat, msg) },
+		model.OutboundMessage{
+			ConversationID: m.ConversationID, ContactID: m.ContactID, AgentID: agentID,
+			TargetChat: chat, Kind: "proactive_reply", Text: msg,
+		})
+	log.Printf("[REMINDER] pengingat meeting #%d dikirim ke pihak eksternal (%s)", m.ID, chat)
+}
+
+// buildExternalReminderText menyusun pesan pengingat WhatsApp untuk pihak eksternal.
+func buildExternalReminderText(who, title string, m *model.MeetingRequest, det meetingDetails, lead int) string {
+	greet := "Halo"
+	if who != "" {
+		greet = "Halo " + who
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s 🙏\n", greet)
+	b.WriteString("Pengingat: pertemuan dengan Pak Sudianto akan segera berlangsung.\n")
+	fmt.Fprintf(&b, "• Agenda: %s\n", title)
+	if m.ProposedDatetime != nil {
+		fmt.Fprintf(&b, "• Waktu: %s (sekitar %d menit lagi)\n", formatWIBLong(*m.ProposedDatetime), lead)
+	}
+	if v := strings.TrimSpace(m.Venue); v != "" {
+		fmt.Fprintf(&b, "• Lokasi: %s\n", v)
+	} else if det.TeamsLink != "" {
+		fmt.Fprintf(&b, "• Tautan: %s\n", det.TeamsLink)
+	} else {
+		b.WriteString("• Silakan bergabung melalui tautan meeting yang telah disiapkan.\n")
+	}
+	b.WriteString("Terima kasih.")
+	return b.String()
+}
+
 // setReminder menjalankan action SET_REMINDER: SU (lewat orchestrator) meminta
 // pengingat pada waktu tertentu. Hanya inisiator ber-trust 'su' yang diizinkan
 // (gerbang keamanan — agar agent/kontak lain tidak bisa menjadwalkan pesan ke SU).
@@ -504,6 +585,166 @@ func (h *Handler) cancelReminder(ctx context.Context, initiator *model.Contact, 
 	log.Printf("[REMINDER] pengingat #%d dibatalkan (seri berulang, bila ada, berhenti)", a.ReminderID)
 }
 
+// scheduleCalendarDigest menjalankan action SCHEDULE_CALENDAR_DIGEST: SU (lewat
+// orchestrator) meminta pengecekan kalender terjadwal — biasanya berulang, mis. tiap
+// hari jam 08:00. Saat jatuh tempo, worker menarik agenda hari itu dari kalender PA
+// (pa@hypernet.co.id) lalu menugaskan orchestrator menyusun ringkasan + rencana kerja
+// untuk Pak Sudianto. Hanya inisiator ber-trust 'su' (gerbang keamanan — sama seperti
+// SET_REMINDER). Disimpan sebagai scheduled_task kind="calendar_digest", created_by="su"
+// sehingga MEMAKAI ULANG mesin recurring, snapshot, dan pembatalan (CANCEL_REMINDER).
+func (h *Handler) scheduleCalendarDigest(ctx context.Context, initiator *model.Contact, a model.Action) {
+	if initiator == nil || initiator.TrustLevel != "su" {
+		trust := "(nil)"
+		if initiator != nil {
+			trust = initiator.TrustLevel
+		}
+		log.Printf("[DIGEST] DITOLAK: inisiator non-SU (trust=%s)", trust)
+		return
+	}
+	// Fokus opsional dari SU (mis. "susun rencana kerja") disimpan di Note, lalu
+	// disuntik ke instruksi saat fire. Boleh kosong.
+	focus := firstNonEmptyStr(strings.TrimSpace(a.ReminderNote), strings.TrimSpace(a.Task))
+	label := strings.TrimSpace(a.ReminderLabel)
+	if label == "" {
+		label = "Digest kalender"
+	}
+	if r := []rune(label); len(r) > 80 {
+		label = string(r[:80])
+	}
+
+	when, terr := parseReminderTime(a.ReminderTime)
+
+	recurKind := strings.ToLower(strings.TrimSpace(a.RecurKind))
+	if recurKind == "none" {
+		recurKind = ""
+	}
+
+	if recurKind != "" {
+		if recurKind != "daily" && recurKind != "weekly" {
+			log.Printf("[DIGEST] recurKind tak dikenal %q — diabaikan", a.RecurKind)
+			return
+		}
+		if _, _, ok := parseHHMM(a.RecurTime); !ok {
+			log.Printf("[DIGEST] recurTime tak valid %q (butuh HH:MM) — diabaikan", a.RecurTime)
+			return
+		}
+		if recurKind == "weekly" && (a.RecurDow == nil || *a.RecurDow < 0 || *a.RecurDow > 6) {
+			log.Printf("[DIGEST] weekly butuh recurDow 0-6 — diabaikan (dapat %v)", a.RecurDow)
+			return
+		}
+		// Kejadian PERTAMA: pakai ReminderTime bila valid, jika tidak turunkan dari
+		// parameter rekurensi (slot berikutnya dari sekarang).
+		first := when
+		if terr != nil {
+			t, ok := nextOccurrence(model.ScheduledTask{RecurKind: recurKind, RecurTime: a.RecurTime, RecurDow: a.RecurDow}, time.Now())
+			if !ok {
+				log.Printf("[DIGEST] tak bisa menghitung kejadian pertama berulang — diabaikan")
+				return
+			}
+			first = t
+		} else if first.Before(time.Now().Add(-1 * time.Minute)) {
+			log.Printf("[DIGEST] waktu pertama sudah lewat (%s) — diabaikan", first.In(wibZone).Format("2006-01-02 15:04 WIB"))
+			return
+		}
+		id, cerr := h.Store.CreateScheduledTask(ctx, model.ScheduledTask{
+			FireAt: first, Kind: "calendar_digest", Note: focus, CreatedBy: "su",
+			RecurKind: recurKind, RecurTime: strings.TrimSpace(a.RecurTime), RecurDow: a.RecurDow, Label: label,
+		})
+		if cerr != nil {
+			log.Printf("[DIGEST] simpan digest berulang gagal: %v", cerr)
+			return
+		}
+		log.Printf("[DIGEST] digest kalender berulang #%d (%s %s) mulai %s", id, recurKind,
+			strings.TrimSpace(a.RecurTime), first.In(wibZone).Format("2006-01-02 15:04 WIB"))
+		return
+	}
+
+	// Sekali tembak: ReminderTime wajib valid.
+	if terr != nil {
+		log.Printf("[DIGEST] waktu tidak valid %q: %v (diabaikan)", a.ReminderTime, terr)
+		return
+	}
+	if when.Before(time.Now().Add(-1 * time.Minute)) {
+		log.Printf("[DIGEST] waktu sudah lewat (%s) — diabaikan", when.In(wibZone).Format("2006-01-02 15:04 WIB"))
+		return
+	}
+	id, cerr := h.Store.CreateScheduledTask(ctx, model.ScheduledTask{
+		FireAt: when, Kind: "calendar_digest", Note: focus, CreatedBy: "su", Label: label,
+	})
+	if cerr != nil {
+		log.Printf("[DIGEST] simpan digest gagal: %v", cerr)
+		return
+	}
+	log.Printf("[DIGEST] digest kalender #%d dijadwalkan %s", id,
+		when.In(wibZone).Format("2006-01-02 15:04 WIB"))
+}
+
+// buildCalendarDigestInstruction menyusun instruksi (giliran sistem) untuk orchestrator
+// saat sebuah digest kalender jatuh tempo: menarik agenda HARI INI langsung dari kalender
+// PA lalu meminta orchestrator meringkasnya dan menyusun rencana kerja untuk Pak Sudianto.
+// Bila layanan kalender nonaktif/gagal, instruksi tetap dikirim dengan catatan agar SU
+// tetap mendapat kabar (bukan diam).
+func (h *Handler) buildCalendarDigestInstruction(ctx context.Context, task model.ScheduledTask) string {
+	now := time.Now().In(wibZone)
+	date := now.Format("2006-01-02")
+	var agenda string
+	switch {
+	case !h.Services.Enabled():
+		agenda = "(Integrasi kalender sedang tidak aktif — agenda tidak dapat diambil otomatis.)"
+	default:
+		evs, err := h.Services.Availability(ctx, date)
+		if err != nil {
+			log.Printf("[DIGEST] ambil kalender %s gagal: %v", date, err)
+			agenda = "(Gagal mengambil agenda dari kalender saat ini.)"
+		} else {
+			agenda = formatCalendarAgenda(evs)
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("[DIGEST KALENDER TERJADWAL — giliran sistem, BUKAN pesan dari Pak Sudianto]\n")
+	fmt.Fprintf(&b, "Ini pengecekan kalender terjadwal untuk %s.\n", formatWIBDate(now))
+	b.WriteString("Susun SATU pesan WhatsApp Bahasa Indonesia yang ramah & ringkas untuk Pak Sudianto: ")
+	b.WriteString("sampaikan ringkasan agenda hari ini, lalu usulkan rencana kerja singkat (prioritas/urutan). ")
+	b.WriteString("JANGAN menyebut bahwa ini proses otomatis atau giliran sistem.\n")
+	if focus := strings.TrimSpace(task.Note); focus != "" {
+		b.WriteString("Fokus/permintaan khusus dari Pak Sudianto: " + focus + "\n")
+	}
+	fmt.Fprintf(&b, "\nAgenda kalender (%s):\n%s", formatWIBDate(now), agenda)
+	return b.String()
+}
+
+// formatCalendarAgenda merangkai daftar event kalender jadi teks ringkas untuk digest.
+func formatCalendarAgenda(evs []services.AvailabilityEvent) string {
+	if len(evs) == 0 {
+		return "- (Tidak ada agenda/meeting terjadwal hari ini.)"
+	}
+	var b strings.Builder
+	for _, e := range evs {
+		s := parseGraphLocal(e.Start)
+		en := parseGraphLocal(e.End)
+		slot := "?"
+		switch {
+		case !s.IsZero() && !en.IsZero():
+			slot = s.Format("15.04") + "–" + en.Format("15.04")
+		case !s.IsZero():
+			slot = s.Format("15.04")
+		}
+		subj := strings.TrimSpace(e.Subject)
+		if subj == "" {
+			subj = "(tanpa judul)"
+		}
+		fmt.Fprintf(&b, "- %s WIB — %s", slot, subj)
+		if loc := strings.TrimSpace(e.Location); loc != "" {
+			b.WriteString(" @ " + loc)
+		} else if e.IsOnline {
+			b.WriteString(" (online)")
+		}
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 // buildReminderSnapshot merakit ringkasan pengingat AKTIF milik SU langsung dari
 // PostgreSQL untuk disisipkan ke konteks orchestrator — sehingga SU bisa menanyakan
 // & membatalkannya (CANCEL_REMINDER) tanpa perlu action LIST khusus.
@@ -533,11 +774,16 @@ func (h *Handler) buildReminderSnapshot(ctx context.Context) string {
 		if label == "" {
 			label = truncateRunes(t.Note, 40)
 		}
-		rows = append(rows, fmt.Sprintf("- reminderId=%d | %s | mulai %s%s", t.ID, label, when, recur))
+		kindTag := ""
+		if t.Kind == "calendar_digest" {
+			kindTag = " [digest kalender]"
+		}
+		rows = append(rows, fmt.Sprintf("- reminderId=%d | %s%s | mulai %s%s", t.ID, label, kindTag, when, recur))
 	}
-	return "[PENGINGAT AKTIF — data LANGSUNG & OTORITATIF dari sistem. Untuk MEMBATALKAN/" +
-		"menghentikan sebuah pengingat, pakai CANCEL_REMINDER dengan reminderId di bawah. " +
-		"Untuk MENGUBAH jadwalnya, batalkan lalu buat baru dengan SET_REMINDER.]\n" +
+	return "[PENGINGAT & DIGEST AKTIF — data LANGSUNG & OTORITATIF dari sistem. Termasuk " +
+		"pengingat (SET_REMINDER) dan digest kalender terjadwal (SCHEDULE_CALENDAR_DIGEST). " +
+		"Untuk MEMBATALKAN/menghentikan salah satunya, pakai CANCEL_REMINDER dengan reminderId " +
+		"di bawah. Untuk MENGUBAH jadwalnya, batalkan lalu buat baru.]\n" +
 		strings.Join(rows, "\n")
 }
 

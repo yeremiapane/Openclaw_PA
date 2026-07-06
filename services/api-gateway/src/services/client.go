@@ -26,11 +26,12 @@ type Client struct {
 }
 
 // New membuat Client. enabled=false (fitur nonaktif, graceful) bila kredensial
-// MS Graph belum lengkap — approval gate tetap jalan tanpa penjadwalan.
-func New(tenantID, clientID, clientSecret, userUPN, fromName, signaturePath string) *Client {
+// MS Graph belum lengkap — approval gate tetap jalan tanpa penjadwalan. refreshToken
+// opsional: dipakai sebagai fallback baca email (Email Watch) bila izin aplikasi belum ada.
+func New(tenantID, clientID, clientSecret, userUPN, refreshToken, fromName, signaturePath string) *Client {
 	enabled := tenantID != "" && clientID != "" && clientSecret != "" && userUPN != ""
 	return &Client{
-		graph:     NewGraphClient(tenantID, clientID, clientSecret, userUPN),
+		graph:     NewGraphClient(tenantID, clientID, clientSecret, userUPN, refreshToken),
 		templates: NewTemplateEngine(signaturePath),
 		fromEmail: userUPN,
 		fromName:  fromName,
@@ -40,6 +41,19 @@ func New(tenantID, clientID, clientSecret, userUPN, fromName, signaturePath stri
 
 // Enabled true bila kredensial MS Graph lengkap.
 func (c *Client) Enabled() bool { return c != nil && c.enabled }
+
+// ListRecentEmails mengambil email inbox terbaru (untuk Email Watch). sinceISO opsional
+// (RFC3339 UTC) memfilter yang lebih baru; top membatasi jumlah. Mencoba izin aplikasi
+// dulu lalu fallback refresh token (lihat GraphClient.ListRecentMessages).
+func (c *Client) ListRecentEmails(_ context.Context, sinceISO string, top int) ([]EmailMessage, error) {
+	return c.graph.ListRecentMessages(sinceISO, top)
+}
+
+// ListSentReplies mengambil email terkirim (folder Sent) sejak sinceISO untuk mendeteksi
+// email inbox yang sudah dibalas (Email Watch, Opsi A). Lihat GraphClient.ListSentMessages.
+func (c *Client) ListSentReplies(_ context.Context, sinceISO string, top int) ([]SentReply, error) {
+	return c.graph.ListSentMessages(sinceISO, top)
+}
 
 // ── Calendar ──────────────────────────────────────────────────────────
 

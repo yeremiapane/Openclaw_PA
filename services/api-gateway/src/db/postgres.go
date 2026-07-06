@@ -298,6 +298,26 @@ CREATE TABLE IF NOT EXISTS agent_preferences (
     prefs      TEXT         NOT NULL DEFAULT '',
     updated_at TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
+
+-- Pemantauan email (Email Watch): SU minta agent MELAPOR proaktif bila ada email masuk
+-- yang cocok dengan kriteria bahasa alami (mis. "follow up dari Yere"). Worker latar
+-- belakang menarik inbox berkala, pra-saring murah (from_filter/keyword_filter), lalu
+-- orchestrator menilai kecocokan & melapor ke SU. last_seen_at = batas bawah waktu email
+-- yang dievaluasi (maju tiap ronde agar tiap email dinilai tepat sekali).
+CREATE TABLE IF NOT EXISTS email_watches (
+    id              BIGSERIAL    PRIMARY KEY,
+    criteria        TEXT         NOT NULL,                  -- kriteria bahasa alami
+    label           VARCHAR(80)  NOT NULL DEFAULT '',       -- rujukan singkat untuk SU
+    from_filter     TEXT         NOT NULL DEFAULT '',       -- pra-saring: substring pengirim
+    keyword_filter  TEXT         NOT NULL DEFAULT '',       -- pra-saring: kata kunci subjek/isi
+    created_by      VARCHAR(64)  NOT NULL DEFAULT 'su',
+    status          VARCHAR(16)  NOT NULL DEFAULT 'active', -- active|cancelled|expired
+    last_seen_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),    -- hanya email setelah ini dinilai
+    expires_at      TIMESTAMPTZ,                            -- opsional auto-kedaluwarsa
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    last_checked_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_email_watch_active ON email_watches (status, created_by);
 `
 
 // NewStore membuka pool ke PostgreSQL.

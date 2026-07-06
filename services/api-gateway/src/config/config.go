@@ -55,6 +55,10 @@ type Config struct {
 	MSGraphClientID     string
 	MSGraphClientSecret string
 	MSGraphUserUPN      string // pengirim email & pemilik calendar
+	// MSGraphRefreshToken = refresh token DELEGATED (opsional) untuk membaca email
+	// (Email Watch). Dipakai sebagai FALLBACK bila izin aplikasi (Mail.Read app) belum
+	// ada / ditolak. Kosong = hanya andalkan izin aplikasi.
+	MSGraphRefreshToken string
 	MailFromName        string // nama tampilan pengirim
 	SignaturePath       string // path signature.html untuk email
 }
@@ -117,6 +121,7 @@ func Load() Config {
 		MSGraphClientID:     getenv("MS_GRAPH_CLIENT_ID", ""),
 		MSGraphClientSecret: getenv("MS_GRAPH_CLIENT_SECRET", ""),
 		MSGraphUserUPN:      getenv("MS_GRAPH_USER_UPN", ""),
+		MSGraphRefreshToken: getenv("MS_GRAPH_REFRESH_TOKEN", ""),
 		MailFromName:        getenv("FROM_NAME", "PA Asisten"),
 		SignaturePath:       getenv("SIGNATURE_PATH", "assets/signature.html"),
 	}

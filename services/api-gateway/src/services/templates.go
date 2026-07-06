@@ -164,7 +164,7 @@ func (te *TemplateEngine) RenderInvitation(data MeetingEmailData) (string, error
             <td style="padding:6px 0;">{{.Time}}</td>
           </tr>
           <tr>
-            <td style="padding:6px 0; color:#666666; vertical-align:top;">Lokasi</td>
+            <td style="padding:6px 0; color:#666666; vertical-align:top;">Alamat</td>
             <td style="padding:6px 0;">{{.Venue}}</td>
           </tr>{{if .TeamsLink}}
           <tr>

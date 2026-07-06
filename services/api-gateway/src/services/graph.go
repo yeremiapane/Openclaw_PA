@@ -24,19 +24,30 @@ type GraphClient struct {
 	clientSecret string
 	userUPN      string // pengirim email & pemilik calendar (pa@hypernet.co.id)
 
+	// refreshToken = token DELEGATED opsional (dari .env) untuk fallback baca email
+	// saat izin aplikasi (Mail.Read app) tak tersedia. Dapat DIROTASI oleh Azure AD;
+	// nilai terbaru disimpan di memori (delRefresh) selama proses hidup.
+	refreshToken string
+
 	mu          sync.Mutex
 	accessToken string
 	expiresAt   time.Time
-	httpClient  *http.Client
+	// Token delegated (hasil refresh_token grant) — cache terpisah dari token aplikasi.
+	delToken     string
+	delExpiresAt time.Time
+	delRefresh   string // refresh token terbaru (rotasi) selama proses hidup
+	httpClient   *http.Client
 }
 
-// NewGraphClient membuat client MS Graph baru.
-func NewGraphClient(tenantID, clientID, clientSecret, userUPN string) *GraphClient {
+// NewGraphClient membuat client MS Graph baru. refreshToken opsional (fallback baca email).
+func NewGraphClient(tenantID, clientID, clientSecret, userUPN, refreshToken string) *GraphClient {
 	return &GraphClient{
 		tenantID:     tenantID,
 		clientID:     clientID,
 		clientSecret: clientSecret,
 		userUPN:      userUPN,
+		refreshToken: refreshToken,
+		delRefresh:   refreshToken,
 		httpClient:   &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -44,11 +55,12 @@ func NewGraphClient(tenantID, clientID, clientSecret, userUPN string) *GraphClie
 // ── Token Management ──────────────────────────────────────────────────
 
 type tokenResponse struct {
-	AccessToken string `json:"access_token"`
-	ExpiresIn   int    `json:"expires_in"`
-	TokenType   string `json:"token_type"`
-	Error       string `json:"error"`
-	ErrorDesc   string `json:"error_description"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"` // hanya pada refresh_token grant (rotasi)
+	ExpiresIn    int    `json:"expires_in"`
+	TokenType    string `json:"token_type"`
+	Error        string `json:"error"`
+	ErrorDesc    string `json:"error_description"`
 }
 
 // getToken mengambil access token (cached, refresh otomatis saat hampir expired).
@@ -90,6 +102,62 @@ func (g *GraphClient) getToken() (string, error) {
 	g.expiresAt = time.Now().Add(time.Duration(tr.ExpiresIn-60) * time.Second)
 	log.Printf("[graph] token diperoleh, berlaku ~%d detik", tr.ExpiresIn)
 	return g.accessToken, nil
+}
+
+// getDelegatedToken menukar refresh token (delegated) menjadi access token untuk
+// membaca email atas nama pemilik mailbox. Dipakai sebagai FALLBACK saat izin aplikasi
+// (Mail.Read app) tak tersedia. Access token di-cache; refresh token bisa dirotasi oleh
+// Azure AD — nilai terbaru disimpan di delRefresh (memori) selama proses hidup, sehingga
+// rotasi tak memutus rantai sampai restart (setelah restart baca ulang dari .env).
+func (g *GraphClient) getDelegatedToken() (string, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.delToken != "" && time.Now().Before(g.delExpiresAt) {
+		return g.delToken, nil
+	}
+	rt := g.delRefresh
+	if rt == "" {
+		rt = g.refreshToken
+	}
+	if rt == "" {
+		return "", fmt.Errorf("refresh token kosong (MS_GRAPH_REFRESH_TOKEN belum diset)")
+	}
+
+	tokenURL := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", g.tenantID)
+	data := url.Values{
+		"grant_type":    {"refresh_token"},
+		"client_id":     {g.clientID},
+		"client_secret": {g.clientSecret},
+		"refresh_token": {rt},
+		"scope":         {"https://graph.microsoft.com/.default offline_access"},
+	}
+
+	resp, err := g.httpClient.PostForm(tokenURL, data)
+	if err != nil {
+		return "", fmt.Errorf("refresh token request gagal: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	var tr tokenResponse
+	if err := json.Unmarshal(body, &tr); err != nil {
+		return "", fmt.Errorf("refresh token decode gagal: %w", err)
+	}
+	if tr.Error != "" {
+		return "", fmt.Errorf("refresh token error: %s — %s", tr.Error, tr.ErrorDesc)
+	}
+	if tr.AccessToken == "" {
+		return "", fmt.Errorf("access token (delegated) kosong (HTTP %d): %s", resp.StatusCode, truncate(string(body), 300))
+	}
+
+	g.delToken = tr.AccessToken
+	g.delExpiresAt = time.Now().Add(time.Duration(tr.ExpiresIn-60) * time.Second)
+	if tr.RefreshToken != "" {
+		g.delRefresh = tr.RefreshToken // simpan rotasi
+	}
+	log.Printf("[graph] token delegated (refresh) diperoleh, berlaku ~%d detik", tr.ExpiresIn)
+	return g.delToken, nil
 }
 
 // doRequest menjalankan HTTP request ke MS Graph dengan Bearer token + JSON header.
@@ -203,7 +271,7 @@ type CalendarEvent struct {
 	DurationMinutes int    // default 60
 	Venue           string // lokasi; kosong = online
 	Attendees       []string
-	ReminderMinutes int  // default 180 (3 jam)
+	ReminderMinutes int // default 180 (3 jam)
 	Body            string
 	IsOnline        bool // true → onlineMeetingProvider teamsForBusiness
 }
@@ -476,6 +544,187 @@ func (g *GraphClient) ListEvents(date string) ([]AvailabilityEvent, error) {
 	}
 	log.Printf("[calendar] availability date=%s: %d event(s)", date, len(events))
 	return events, nil
+}
+
+// ── Mail.Read API (Email Watch) ───────────────────────────────────────
+
+// EmailMessage = ringkasan satu email untuk pemantauan (Email Watch). Isi (subject/
+// preview/from) berasal dari pihak LUAR — perlakukan sebagai DATA tak tepercaya di hilir.
+type EmailMessage struct {
+	ID               string `json:"id"`
+	Subject          string `json:"subject"`
+	FromName         string `json:"fromName"`
+	FromAddress      string `json:"fromAddress"`
+	ReceivedDateTime string `json:"receivedDateTime"` // ISO 8601 (UTC)
+	BodyPreview      string `json:"bodyPreview"`      // ringkas (dipangkas Graph)
+	WebLink          string `json:"webLink"`
+	IsRead           bool   `json:"isRead"`         // false = belum dibaca (unread) di inbox SU
+	ConversationID   string `json:"conversationId"` // untuk deteksi "sudah dibalas" (cocokkan folder Sent)
+}
+
+// SentReply = ringkasan satu email di folder Sent, dipakai untuk mendeteksi email inbox
+// yang SUDAH dibalas: bila ada SentReply ber-ConversationID sama & SentDateTime lebih baru
+// dari email masuk, email itu dianggap sudah dibalas.
+type SentReply struct {
+	ConversationID string `json:"conversationId"`
+	SentDateTime   string `json:"sentDateTime"` // ISO 8601 (UTC)
+}
+
+type graphMessagesResponse struct {
+	Value []struct {
+		ID   string `json:"id"`
+		From struct {
+			EmailAddress graphEmail `json:"emailAddress"`
+		} `json:"from"`
+		Subject          string `json:"subject"`
+		BodyPreview      string `json:"bodyPreview"`
+		ReceivedDateTime string `json:"receivedDateTime"`
+		WebLink          string `json:"webLink"`
+		IsRead           bool   `json:"isRead"`
+		ConversationID   string `json:"conversationId"`
+	} `json:"value"`
+}
+
+type graphSentResponse struct {
+	Value []struct {
+		ConversationID string `json:"conversationId"`
+		SentDateTime   string `json:"sentDateTime"`
+	} `json:"value"`
+}
+
+// ListRecentMessages mengambil email inbox terbaru milik userUPN, dari yang paling baru.
+// sinceISO (opsional, RFC3339 UTC) memfilter receivedDateTime >= sinceISO. top membatasi
+// jumlah (default 25). Mencoba izin APLIKASI dulu (client_credentials + Mail.Read app);
+// bila ditolak (401/403), FALLBACK ke token DELEGATED dari refresh token .env. Bila
+// keduanya gagal, mengembalikan error.
+func (g *GraphClient) ListRecentMessages(sinceISO string, top int) ([]EmailMessage, error) {
+	if top <= 0 {
+		top = 25
+	}
+	apiURL := fmt.Sprintf(
+		"https://graph.microsoft.com/v1.0/users/%s/mailFolders/Inbox/messages?$select=id,subject,from,bodyPreview,receivedDateTime,webLink,isRead,conversationId&$orderby=receivedDateTime%%20desc&$top=%d",
+		g.userUPN, top,
+	)
+	if s := strings.TrimSpace(sinceISO); s != "" {
+		apiURL += "&$filter=" + url.QueryEscape("receivedDateTime ge "+s)
+	}
+
+	respBody, err := g.doMailReadRequest(apiURL, "email")
+	if err != nil {
+		return nil, err
+	}
+	var result graphMessagesResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("decode messages gagal: %w", err)
+	}
+	out := make([]EmailMessage, 0, len(result.Value))
+	for _, m := range result.Value {
+		out = append(out, EmailMessage{
+			ID:               m.ID,
+			Subject:          m.Subject,
+			FromName:         m.From.EmailAddress.Name,
+			FromAddress:      m.From.EmailAddress.Address,
+			ReceivedDateTime: m.ReceivedDateTime,
+			BodyPreview:      m.BodyPreview,
+			WebLink:          m.WebLink,
+			IsRead:           m.IsRead,
+			ConversationID:   m.ConversationID,
+		})
+	}
+	log.Printf("[email] inbox %s: %d email terbaru", g.userUPN, len(out))
+	return out, nil
+}
+
+// ListSentMessages mengambil email yang TERKIRIM (folder SentItems) sejak sinceISO, dipakai
+// untuk mendeteksi email inbox yang sudah dibalas (cocokkan conversationId + waktu). Auth
+// sama seperti ListRecentMessages (izin aplikasi → fallback refresh token).
+func (g *GraphClient) ListSentMessages(sinceISO string, top int) ([]SentReply, error) {
+	if top <= 0 {
+		top = 50
+	}
+	apiURL := fmt.Sprintf(
+		"https://graph.microsoft.com/v1.0/users/%s/mailFolders/SentItems/messages?$select=conversationId,sentDateTime&$orderby=sentDateTime%%20desc&$top=%d",
+		g.userUPN, top,
+	)
+	if s := strings.TrimSpace(sinceISO); s != "" {
+		apiURL += "&$filter=" + url.QueryEscape("sentDateTime ge "+s)
+	}
+
+	respBody, err := g.doMailReadRequest(apiURL, "sent")
+	if err != nil {
+		return nil, err
+	}
+	var result graphSentResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("decode sent gagal: %w", err)
+	}
+	out := make([]SentReply, 0, len(result.Value))
+	for _, m := range result.Value {
+		out = append(out, SentReply{ConversationID: m.ConversationID, SentDateTime: m.SentDateTime})
+	}
+	log.Printf("[email] sent %s: %d email terkirim", g.userUPN, len(out))
+	return out, nil
+}
+
+// doMailReadRequest menjalankan GET ke MS Graph mail API dengan dual-auth: coba izin
+// APLIKASI dulu (client_credentials + Mail.Read app); bila ditolak (401/403), FALLBACK ke
+// token DELEGATED dari refresh token .env. Error selain izin (400/5xx) tidak diam-diam
+// fallback. Mengembalikan body respons mentah untuk di-decode pemanggil. label hanya untuk log.
+func (g *GraphClient) doMailReadRequest(apiURL, label string) ([]byte, error) {
+	// 1) Coba izin aplikasi (app-only).
+	if appTok, err := g.getToken(); err == nil {
+		body, status, rerr := g.fetchRaw(apiURL, appTok)
+		if rerr == nil && status < 300 {
+			return body, nil
+		}
+		if status != http.StatusUnauthorized && status != http.StatusForbidden {
+			if rerr != nil {
+				return nil, fmt.Errorf("baca %s (app) gagal: %w", label, rerr)
+			}
+			return nil, fmt.Errorf("baca %s (app) HTTP %d", label, status)
+		}
+		log.Printf("[email] izin aplikasi baca %s ditolak (HTTP %d) — fallback ke refresh token", label, status)
+	} else {
+		log.Printf("[email] token aplikasi gagal (%v) — coba refresh token", err)
+	}
+
+	// 2) Fallback: token delegated dari refresh token .env.
+	delTok, err := g.getDelegatedToken()
+	if err != nil {
+		return nil, fmt.Errorf("baca %s: izin aplikasi ditolak & refresh token tak tersedia: %w", label, err)
+	}
+	body, status, rerr := g.fetchRaw(apiURL, delTok)
+	if rerr != nil {
+		return nil, fmt.Errorf("baca %s (delegated) gagal: %w", label, rerr)
+	}
+	if status >= 300 {
+		return nil, fmt.Errorf("baca %s (delegated) HTTP %d", label, status)
+	}
+	return body, nil
+}
+
+// fetchRaw menjalankan GET dengan token tertentu, mengembalikan (body, statusHTTP, error-
+// transport). Status >= 300 BUKAN error-transport (pemanggil memutuskan fallback via status).
+func (g *GraphClient) fetchRaw(apiURL, token string) ([]byte, int, error) {
+	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Prefer", `outlook.body-content-type="text"`)
+
+	resp, err := g.httpClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		log.Printf("[email] mail read HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 300))
+		return respBody, resp.StatusCode, nil
+	}
+	return respBody, resp.StatusCode, nil
 }
 
 func truncate(s string, n int) string {

@@ -63,7 +63,7 @@ func main() {
 	// Dipanggil hanya oleh approval gate setelah SU approve. Tak ada port polos.
 	svcClient := services.New(
 		cfg.MSGraphTenantID, cfg.MSGraphClientID, cfg.MSGraphClientSecret,
-		cfg.MSGraphUserUPN, cfg.MailFromName, cfg.SignaturePath,
+		cfg.MSGraphUserUPN, cfg.MSGraphRefreshToken, cfg.MailFromName, cfg.SignaturePath,
 	)
 
 	h := &routes.Handler{Waha: wahaClient, Store: store, OpenClaw: openClawClient, Memory: mem, Services: svcClient, SUPhone: cfg.SUPhone, NovaPhone: cfg.NovaPhone, ReminderLeadMinutes: cfg.ReminderLeadMinutes}
@@ -71,6 +71,9 @@ func main() {
 
 	// --- Worker pengingat (Fase A): kirim tugas terjadwal ke SU saat jatuh tempo ---
 	h.StartScheduler(ctx)
+
+	// --- Worker pantauan email (Fitur E): periksa inbox berkala, lapor email yang cocok ---
+	h.StartEmailWatcher(ctx)
 
 	r := gin.Default()
 

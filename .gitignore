@@ -42,3 +42,5 @@ log.txt
 /.waha.noweb.bak
 
 *test*.go
+
+*test.go

@@ -286,6 +286,11 @@ type Message struct {
 // "REQUEST_MEETING_CHANGE" (ChangeKind+Reason + opsional NewDatetime), "CONFIRM_VENUE"
 // (VenueName+VenueAddress), "SET_REMINDER" (ReminderTime+ReminderNote + opsional
 // RecurKind/RecurTime/RecurDow/ReminderLabel), "CANCEL_REMINDER" (ReminderID),
+// "SCHEDULE_CALENDAR_DIGEST" (RecurKind/RecurTime/RecurDow atau ReminderTime + opsional
+// ReminderNote sbg fokus + ReminderLabel; dibatalkan lewat CANCEL_REMINDER),
+// "WATCH_EMAIL" (WatchCriteria + opsional WatchFrom/WatchKeyword/WatchLabel),
+// "CANCEL_WATCH" (WatchID),
+// "READ_EMAILS" (opsional EmailScope=unread|unreplied|all + EmailFrom/EmailKeyword),
 // "SEND_DOCUMENT" (DocFilename+DocContent + opsional DocMime/DocEncoding/DocCaption),
 // "UPDATE_AGENT_PERSONA" (PersonaText + opsional TargetAgent).
 type Action struct {
@@ -336,6 +341,26 @@ type Action struct {
 	// CANCEL_REMINDER (orchestrator/SU): ReminderID = id pengingat aktif (lihat snapshot)
 	// yang ingin dibatalkan. Untuk pengingat berulang, membatalkan menghentikan seluruh seri.
 	ReminderID int64 `json:"reminderId,omitempty"`
+	// WATCH_EMAIL (orchestrator/SU): pantau inbox & lapor proaktif bila ada email yang cocok.
+	//   WatchCriteria = kriteria bahasa alami (mis. "email follow up dari Yere"). WAJIB.
+	//   WatchFrom     = pra-saring pengirim (substring email/nama; opsional, hemat token).
+	//   WatchKeyword  = pra-saring kata kunci subjek/isi (opsional).
+	//   WatchLabel    = rujukan singkat untuk pembatalan (opsional).
+	// CANCEL_WATCH (orchestrator/SU): WatchID = id pantauan aktif (lihat snapshot) yang dihentikan.
+	WatchCriteria string `json:"watchCriteria,omitempty"`
+	WatchFrom     string `json:"watchFrom,omitempty"`
+	WatchKeyword  string `json:"watchKeyword,omitempty"`
+	WatchLabel    string `json:"watchLabel,omitempty"`
+	WatchID       int64  `json:"watchId,omitempty"`
+	// READ_EMAILS (orchestrator/SU): cek inbox SAAT ITU JUGA (on-demand), beda dari
+	// WATCH_EMAIL yang proaktif. Sistem menarik email terbaru, menyaring sesuai scope,
+	// lalu menyuntik hasilnya balik ke orchestrator untuk disusun jadi laporan ke SU.
+	//   EmailScope   = "unread" (belum dibaca) | "unreplied" (belum dibalas) | "" / "all" (semua terbaru).
+	//   EmailFrom    = filter pengirim opsional (substring email/nama).
+	//   EmailKeyword = filter kata kunci subjek/isi opsional (dipisah koma = OR).
+	EmailScope   string `json:"emailScope,omitempty"`
+	EmailFrom    string `json:"emailFrom,omitempty"`
+	EmailKeyword string `json:"emailKeyword,omitempty"`
 	// SEND_DOCUMENT (orchestrator/SU): Agent menyediakan isi laporan/dokumen lalu
 	// gateway menulis file dan mengirim. Gateway tidak menyimpan template atau logika.
 	//   DocFilename = nama file dengan ekstensi (contoh: "Laporan Juni.csv").
@@ -479,6 +504,25 @@ type ScheduledTask struct {
 	Label     string     `json:"label,omitempty"`
 	CreatedAt time.Time  `json:"created_at"`
 	FiredAt   *time.Time `json:"fired_at,omitempty"`
+}
+
+// EmailWatch = satu permintaan pemantauan email (Email Watch). SU meminta agent
+// MELAPOR proaktif bila ada email masuk yang cocok dengan Criteria (bahasa alami).
+// FromFilter/KeywordFilter = pra-saring murah (opsional) agar hanya kandidat relevan
+// yang dinilai LLM. LastSeenAt = batas bawah waktu email yang dinilai (maju tiap ronde,
+// sehingga tiap email dievaluasi tepat sekali). Status: active|cancelled|expired.
+type EmailWatch struct {
+	ID            int64      `json:"id"`
+	Criteria      string     `json:"criteria"`
+	Label         string     `json:"label,omitempty"`
+	FromFilter    string     `json:"from_filter,omitempty"`
+	KeywordFilter string     `json:"keyword_filter,omitempty"`
+	CreatedBy     string     `json:"created_by"`
+	Status        string     `json:"status"`
+	LastSeenAt    time.Time  `json:"last_seen_at"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	LastCheckedAt *time.Time `json:"last_checked_at,omitempty"`
 }
 
 // MeetingStatusEvent = satu transisi status pada meeting_status_history.

@@ -490,6 +490,90 @@ func (s *Store) FindVenuePendingMeetingByDate(ctx context.Context, wibDate strin
 	return scanMeetingRow(row)
 }
 
+// VenueSuggestion = satu lokasi yang pernah dipakai untuk meeting, beserta seberapa sering
+// & alamat terakhir yang tercatat. Dipakai untuk merekomendasikan venue familiar ke Bu Nova.
+type VenueSuggestion struct {
+	Name    string
+	Address string
+	Times   int
+}
+
+// venueNameExpr = ekspresi SQL untuk NAMA venue sebuah meeting: pakai details->>'venueName'
+// bila ada, jatuh ke kolom venue (yang mungkin berisi "Nama — Alamat"). venueAddrExpr =
+// alamat terpisah bila tercatat. Keduanya dipakai query riwayat venue di bawah.
+const venueNameExpr = `COALESCE(NULLIF(details->>'venueName',''), NULLIF(venue,''))`
+const venueAddrExpr = `COALESCE(details->>'venueAddress','')`
+
+// scanVenueSuggestions memindai baris (name, address, times) dari query riwayat venue.
+func scanVenueSuggestions(rows pgx.Rows) ([]VenueSuggestion, error) {
+	defer rows.Close()
+	var out []VenueSuggestion
+	for rows.Next() {
+		var v VenueSuggestion
+		if err := rows.Scan(&v.Name, &v.Address, &v.Times); err != nil {
+			return nil, err
+		}
+		v.Name = strings.TrimSpace(v.Name)
+		v.Address = strings.TrimSpace(v.Address)
+		if v.Name != "" {
+			out = append(out, v)
+		}
+	}
+	return out, rows.Err()
+}
+
+// VenueHistoryForExternal mengembalikan lokasi yang PERNAH dipakai untuk meeting offline
+// (status 'scheduled'/'completed') dengan pihak eksternal yang SAMA (cocok nama, tak peka
+// huruf), diurut dari yang paling sering lalu paling baru. Dipakai untuk menyarankan venue
+// familiar. Nama kosong → daftar kosong (bukan error).
+func (s *Store) VenueHistoryForExternal(ctx context.Context, externalName string, limit int) ([]VenueSuggestion, error) {
+	externalName = strings.TrimSpace(externalName)
+	if externalName == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 3
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+venueNameExpr+` AS vname,
+		       MAX(`+venueAddrExpr+`) AS vaddr,
+		       COUNT(*)::int AS times
+		FROM meeting_requests
+		WHERE status IN ('scheduled','completed')
+		  AND `+venueNameExpr+` IS NOT NULL
+		  AND lower(COALESCE(external_name,'')) = lower($1)
+		GROUP BY `+venueNameExpr+`
+		ORDER BY times DESC, MAX(updated_at) DESC
+		LIMIT $2`, externalName, limit)
+	if err != nil {
+		return nil, err
+	}
+	return scanVenueSuggestions(rows)
+}
+
+// FrequentVenues mengembalikan lokasi yang paling sering dipakai LINTAS semua pihak eksternal
+// (status 'scheduled'/'completed'), diurut paling sering lalu paling baru. Dipakai sebagai
+// cadangan rekomendasi bila belum ada riwayat dengan pihak eksternal tertentu.
+func (s *Store) FrequentVenues(ctx context.Context, limit int) ([]VenueSuggestion, error) {
+	if limit <= 0 {
+		limit = 3
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+venueNameExpr+` AS vname,
+		       MAX(`+venueAddrExpr+`) AS vaddr,
+		       COUNT(*)::int AS times
+		FROM meeting_requests
+		WHERE status IN ('scheduled','completed')
+		  AND `+venueNameExpr+` IS NOT NULL
+		GROUP BY `+venueNameExpr+`
+		ORDER BY times DESC, MAX(updated_at) DESC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	return scanVenueSuggestions(rows)
+}
+
 // FindUnfinalizedOfflineMeetings mengembalikan meeting offline yang WAKTU-nya sudah
 // disetujui SU (status 'approved') DAN lokasinya sudah dikonfirmasi (venueConfirmed=true)
 // namun BELUM difinalisasi menjadi 'scheduled' — mis. karena proses finalisasi terputus.

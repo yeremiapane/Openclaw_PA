@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -155,7 +156,13 @@ func (h *Handler) process(contact *model.Contact, agentID, convID, from, text, r
 				if snap := h.buildMeetingSnapshot(ctx); snap != "" {
 					mc.LiveStatus += "\n\n" + snap
 				}
+				if snap := h.buildCalendarSnapshot(ctx); snap != "" {
+					mc.LiveStatus += "\n\n" + snap
+				}
 				if snap := h.buildReminderSnapshot(ctx); snap != "" {
+					mc.LiveStatus += "\n\n" + snap
+				}
+				if snap := h.buildWatchSnapshot(ctx); snap != "" {
 					mc.LiveStatus += "\n\n" + snap
 				}
 				if snap := h.buildPersonaSnapshot(ctx); snap != "" {
@@ -416,6 +423,71 @@ func (h *Handler) buildMeetingSnapshot(ctx context.Context) string {
 		"MEMBATALKAN pakai CANCEL_MEETING (meetingId). JANGAN buat meeting baru untuk " +
 		"mengubah/membatalkan yang sudah ada.]\n" +
 		strings.Join(rows, "\n")
+}
+
+// Cache singkat snapshot kalender O365 agar tidak memanggil MS Graph pada SETIAP giliran
+// SU (menghemat latensi & kuota). Kalender jarang berubah dalam hitungan menit, jadi TTL
+// pendek aman; perubahan baru akan tampak setelah TTL kedaluwarsa.
+const calSnapTTL = 2 * time.Minute
+
+var (
+	calSnapMu      sync.Mutex
+	calSnapValue   string
+	calSnapFetched time.Time
+)
+
+// buildCalendarSnapshot merakit ringkasan jadwal LANGSUNG dari kalender O365 PA
+// (pa@hypernet.co.id) untuk HARI INI + BESOK, agar orchestrator dapat menjawab pertanyaan
+// jadwal ad-hoc ("apa jadwal saya beberapa jam ke depan?") dengan MENGGABUNGKANNYA dengan
+// [STATUS MEETING] (pipeline PA dari DB). Hasil di-cache singkat (calSnapTTL) supaya tidak
+// memanggil Graph tiap giliran SU. "" bila layanan kalender nonaktif atau kedua hari gagal
+// diambil.
+func (h *Handler) buildCalendarSnapshot(ctx context.Context) string {
+	if !h.Services.Enabled() {
+		return ""
+	}
+	calSnapMu.Lock()
+	if !calSnapFetched.IsZero() && time.Since(calSnapFetched) < calSnapTTL {
+		v := calSnapValue
+		calSnapMu.Unlock()
+		return v
+	}
+	calSnapMu.Unlock()
+
+	now := time.Now().In(wibZone)
+	days := []struct {
+		label string
+		day   time.Time
+	}{
+		{"Hari ini (" + formatWIBDate(now) + ")", now},
+		{"Besok (" + formatWIBDate(now.AddDate(0, 0, 1)) + ")", now.AddDate(0, 0, 1)},
+	}
+	var sections []string
+	for _, d := range days {
+		evs, err := h.Services.Availability(ctx, d.day.Format("2006-01-02"))
+		if err != nil {
+			log.Printf("[SNAPSHOT] kalender %s gagal: %v", d.day.Format("2006-01-02"), err)
+			continue
+		}
+		sections = append(sections, d.label+":\n"+formatCalendarAgenda(evs))
+	}
+
+	snap := ""
+	if len(sections) > 0 {
+		snap = "[KALENDER O365 — jadwal terkonfirmasi di kalender Pak Sudianto (pa@hypernet.co.id), " +
+			"data LANGSUNG dari sistem. Ini MELENGKAPI [STATUS MEETING] (pipeline PA): kalender = " +
+			"acara terkonfirmasi (termasuk janji pribadi & undangan dari luar); STATUS MEETING = " +
+			"meeting yang dikelola PA (termasuk yang masih menunggu/belum masuk kalender). Untuk " +
+			"pertanyaan jadwal, gabungkan keduanya; bila sebuah acara muncul di kedua sumber, " +
+			"sebutkan SEKALI saja. \"beberapa jam ke depan\" = saring dari waktu sekarang. Waktu WIB.]\n" +
+			strings.Join(sections, "\n\n")
+	}
+
+	calSnapMu.Lock()
+	calSnapValue = snap
+	calSnapFetched = time.Now()
+	calSnapMu.Unlock()
+	return snap
 }
 
 // jsonNudge ditambahkan ke pesan saat retry parse_error: mengingatkan agent agar
@@ -806,8 +878,30 @@ func (h *Handler) applyActions(ctx context.Context, convID string, contact *mode
 		case "CANCEL_REMINDER":
 			// SU (lewat orchestrator) menghentikan pengingat aktif berdasarkan reminderId
 			// (dari snapshot [PENGINGAT AKTIF]). Untuk berulang, menghentikan seri.
-			// Hanya boleh dari percakapan SU (gerbang di cancelReminder).
+			// Juga membatalkan digest kalender (created_by='su'). Hanya dari percakapan SU.
 			h.cancelReminder(ctx, contact, a)
+		case "SCHEDULE_CALENDAR_DIGEST":
+			// SU (lewat orchestrator) minta pengecekan kalender terjadwal (mis. tiap hari
+			// jam 08:00) yang menarik agenda hari itu lalu menyusun rencana kerja.
+			// Disimpan ke scheduled_tasks (kind=calendar_digest). Hanya boleh dari
+			// percakapan SU (gerbang di scheduleCalendarDigest).
+			h.scheduleCalendarDigest(ctx, contact, a)
+		case "WATCH_EMAIL":
+			// SU (lewat orchestrator) minta pemantauan inbox: lapor proaktif bila ada email
+			// masuk yang cocok kriteria. Disimpan ke email_watches; worker latar belakang
+			// menilai & melapor. Hanya dari percakapan SU (gerbang di watchEmail).
+			h.watchEmail(ctx, contact, a)
+		case "CANCEL_WATCH":
+			// SU (lewat orchestrator) menghentikan pantauan email aktif berdasarkan watchId
+			// (dari snapshot [PANTAUAN EMAIL AKTIF]). Hanya dari percakapan SU.
+			h.cancelWatch(ctx, contact, a)
+		case "READ_EMAILS":
+			// SU (lewat orchestrator) minta cek inbox SAAT ITU JUGA (on-demand): tarik email
+			// terbaru, saring (belum dibaca/belum dibalas/semua), lalu suntik hasil balik ke
+			// orchestrator untuk dilaporkan ke SU. Goroutine sendiri karena penarikan Graph +
+			// giliran LLM bisa lama. Hanya dari percakapan SU (gerbang di readEmails).
+			act := a
+			go h.readEmails(contact, act)
 		case "SEND_DOCUMENT":
 			// SU (lewat orchestrator) minta sebuah laporan/dokumen. Agent menyusun
 			// SENDIRI isi & format-nya; gateway hanya mengemas jadi file & mengirim ke
@@ -862,22 +956,16 @@ func (h *Handler) spawnOutbound(initiator *model.Contact, act model.Action, srcT
 		return
 	}
 
-	// Spawn ke 'support' = koordinasi venue, dan koordinator venue SELALU Bu Nova
-	// (otoritatif dari env NOVA_PHONE). Orchestrator (LLM) kerap mengosongkan atau
-	// keliru mengisi `target` karena tak punya nomor Bu Nova di konteksnya. Maka untuk
-	// support kita PAKSA target = Nova dan (di bawah) LEWATI semua koreksi/peminjaman
-	// nomor manusia. Tanpa ini, reconcileMSISDN bisa "meminjam" satu-satunya nomor
-	// manusia di pesan SU (mis. orang yang justru ingin dihubungi SU) sehingga pesan
-	// venue "Halo Bu Nova ..." malah TERKIRIM KE KONTAK YANG SALAH.
+	// GERBANG (alur terbaru gw_live34): koordinasi venue ke Bu Nova kini SEPENUHNYA
+	// OTOMATIS oleh sistem — baru dipicu SETELAH Pak Sudianto MENYETUJUI WAKTU
+	// (DecideApproval → dispatchVenueCoordination/dispatchVenueRecoordination). Karena itu
+	// spawn manual ke 'support' dari orchestrator SELALU prematur (dulu bug: Bu Nova
+	// dihubungi di awal, sebelum SU & eksternal sepakat waktu). Blokir di sini agar
+	// instruksi orchestrator yang usang/nondeterministik tak membocorkan pesan venue lebih
+	// awal. Jalur otomatis TIDAK lewat spawnOutbound, jadi aman.
 	if agentID == "support" {
-		if strings.TrimSpace(h.NovaPhone) == "" {
-			log.Printf("[SPAWN] support tapi NOVA_PHONE kosong — dibatalkan")
-			h.notifySpawnFailed(act.TargetName, act.Target, "nomor koordinator venue (Nova) tidak dikonfigurasi")
-			return
-		}
-		act.Target = h.NovaPhone
-		act.TargetName = "Nova"
-		log.Printf("[SPAWN] support → koordinator venue Bu Nova (%s) [paksa; target LLM diabaikan]", h.NovaPhone)
+		log.Printf("[SPAWN] support DITOLAK: koordinasi venue kini otomatis setelah SU menyetujui waktu (spawn manual diabaikan)")
+		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
@@ -1544,6 +1632,43 @@ func (h *Handler) dispatchNovaVenue(meetingID int64, instruction string) {
 	log.Printf("[VENUE-COORD] Bu Nova ditugaskan koordinasi venue meeting #%d", m.ID)
 }
 
+// buildVenueRecommendations menyusun cuplikan rekomendasi lokasi dari RIWAYAT meeting untuk
+// disuntikkan ke instruksi Bu Nova: utamakan lokasi yang pernah dipakai dengan pihak eksternal
+// yang SAMA, lalu cadangan lokasi yang sering dipakai lintas meeting. Kembalikan "" bila tak
+// ada riwayat. Ringkas (maks 3 item). Tanpa biaya. ctx dipakai sebentar (hanya query).
+func (h *Handler) buildVenueRecommendations(ctx context.Context, externalName string) string {
+	if h.Store == nil {
+		return ""
+	}
+	fmtList := func(vs []db.VenueSuggestion) string {
+		parts := make([]string, 0, len(vs))
+		for _, v := range vs {
+			s := v.Name
+			if v.Address != "" {
+				s += " (" + v.Address + ")"
+			}
+			parts = append(parts, s)
+		}
+		return strings.Join(parts, "; ")
+	}
+	if hist, err := h.Store.VenueHistoryForExternal(ctx, externalName, 3); err == nil && len(hist) > 0 {
+		return " Lokasi yang PERNAH dipakai dengan " + firstNonEmptyStr(strings.TrimSpace(externalName), "pihak ini") +
+			": " + fmtList(hist) + " — utamakan bila masih cocok."
+	}
+	if freq, err := h.Store.FrequentVenues(ctx, 3); err == nil && len(freq) > 0 {
+		return " Lokasi yang sering dipakai Pak Sudianto: " + fmtList(freq) + " — boleh dijadikan referensi."
+	}
+	return ""
+}
+
+// venueCompletionRule = instruksi baku (dipakai koordinasi awal & ulang) agar Bu Nova selalu
+// memberi alamat LENGKAP; bila hanya menyebut nama tempat, support melengkapi alamat (boleh via
+// web) lalu MENGONFIRMASINYA ke Bu Nova sebelum difinalkan.
+const venueCompletionRule = " Tolong koordinasikan lokasi yang sesuai (boleh cari via web bila perlu). " +
+	"Pastikan ALAMAT LENGKAP: bila Bu Nova hanya menyebut nama tempat tanpa alamat jelas, lengkapi " +
+	"alamatnya lalu KONFIRMASIKAN ke Bu Nova dulu — jangan CONFIRM_VENUE sebelum Bu Nova membenarkan " +
+	"alamat itu. Setelah lokasi & alamat pasti, kirim CONFIRM_VENUE beserta tanggal meeting. Tanpa membahas biaya."
+
 // dispatchVenueCoordination menugaskan Bu Nova mengkoordinasikan venue AWAL sebuah meeting
 // offline — dipanggil SETELAH SU menyetujui waktu (bukan sebelumnya). Alur baru: waktu
 // disepakati eksternal → SU setujui waktu → Nova urus lokasi → finalisasi tanpa approval SU
@@ -1551,26 +1676,30 @@ func (h *Handler) dispatchNovaVenue(meetingID int64, instruction string) {
 func (h *Handler) dispatchVenueCoordination(meetingID int64, ed meetingDetails, when *time.Time) {
 	lctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	m, err := h.Store.MeetingByID(lctx, meetingID)
-	cancel()
 	if err != nil || m == nil {
+		cancel()
 		log.Printf("[VENUE-COORD] meeting #%d tidak ditemukan untuk koordinasi awal: %v", meetingID, err)
 		return
 	}
 	who := firstNonEmptyStr(m.ExternalName, ed.AttendeeName, "pihak eksternal")
+	recs := h.buildVenueRecommendations(lctx, m.ExternalName)
+	pref := strings.TrimSpace(m.Venue)
+	topic := firstNonEmptyStr(ed.Title, m.Topic)
+	cancel()
+
 	var b strings.Builder
-	b.WriteString("Pak Sudianto sudah MENYETUJUI pertemuan tatap muka dengan " + who + ".")
+	b.WriteString("Pak Sudianto sudah menyetujui pertemuan tatap muka dengan " + who + ".")
 	if when != nil {
-		b.WriteString(" Waktu yang sudah disepakati: " + formatWIBLong(*when) + ".")
+		b.WriteString(" Waktu: " + formatWIBLong(*when) + ".")
 	}
-	if t := firstNonEmptyStr(ed.Title, m.Topic); t != "" {
-		b.WriteString(" Topik: " + t + ".")
+	if topic != "" {
+		b.WriteString(" Topik: " + topic + ".")
 	}
-	if pref := strings.TrimSpace(m.Venue); pref != "" {
-		b.WriteString(" Preferensi area/lokasi: " + pref + ".")
+	if pref != "" {
+		b.WriteString(" Preferensi area/lokasi dari Pak Sudianto: " + pref + ".")
 	}
-	b.WriteString(" Mohon koordinasikan & pastikan lokasi pertemuan yang sesuai. Setelah lokasi PASTI, " +
-		"konfirmasikan venue (CONFIRM_VENUE) dan sertakan tanggal meeting agar terpetakan ke pertemuan " +
-		"yang benar. Tanpa membahas biaya.")
+	b.WriteString(recs)
+	b.WriteString(venueCompletionRule)
 	h.dispatchNovaVenue(meetingID, b.String())
 }
 
@@ -1581,18 +1710,21 @@ func (h *Handler) dispatchVenueCoordination(meetingID int64, ed meetingDetails, 
 func (h *Handler) dispatchVenueRecoordination(meetingID int64, ed meetingDetails, newTime *time.Time) {
 	lctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	m, err := h.Store.MeetingByID(lctx, meetingID)
-	cancel()
 	if err != nil || m == nil {
+		cancel()
 		log.Printf("[VENUE-RECOORD] meeting #%d tidak ditemukan: %v", meetingID, err)
 		return
 	}
 	who := firstNonEmptyStr(m.ExternalName, ed.AttendeeName, "pihak eksternal")
 	prevVenue := firstNonEmptyStr(strings.TrimSpace(m.Venue), ed.VenueName)
+	recs := h.buildVenueRecommendations(lctx, m.ExternalName)
+	cancel()
+
 	var b strings.Builder
-	b.WriteString("Pak Sudianto MENJADWAL ULANG pertemuan tatap muka dengan " + who + ".")
+	b.WriteString("Pak Sudianto menjadwal ulang pertemuan tatap muka dengan " + who + ".")
 	// Tegaskan pembatalan lokasi & waktu LAMA agar Nova melepaskan booking sebelumnya.
 	if prevVenue != "" || strings.TrimSpace(ed.RescheduleFrom) != "" {
-		b.WriteString(" MOHON BATALKAN booking lokasi & waktu SEBELUMNYA:")
+		b.WriteString(" Mohon batalkan booking sebelumnya:")
 		if prevVenue != "" {
 			b.WriteString(" lokasi " + prevVenue)
 		}
@@ -1601,14 +1733,41 @@ func (h *Handler) dispatchVenueRecoordination(meetingID int64, ed meetingDetails
 				b.WriteString(" pada " + formatWIBLong(oldAt))
 			}
 		}
-		b.WriteString(" — lepaskan/batalkan pemesanan tersebut.")
+		b.WriteString(".")
 	}
 	if newTime != nil {
-		b.WriteString(" Waktu baru yang sudah disepakati: " + formatWIBLong(*newTime) + ".")
+		b.WriteString(" Waktu baru: " + formatWIBLong(*newTime) + ".")
 	}
-	b.WriteString(" Mohon koordinasikan lokasi untuk waktu baru (boleh mempertahankan lokasi lama bila " +
-		"masih tersedia, atau carikan alternatif yang sesuai). Setelah lokasi PASTI, konfirmasikan venue " +
-		"(CONFIRM_VENUE) dan sertakan tanggal meeting waktu baru agar terpetakan ke pertemuan yang benar. " +
+	b.WriteString(recs)
+	b.WriteString(" Boleh pertahankan lokasi lama bila masih tersedia, atau carikan alternatif yang sesuai." +
+		venueCompletionRule)
+	h.dispatchNovaVenue(meetingID, b.String())
+}
+
+// dispatchVenueCancellation memberi tahu Bu Nova bahwa meeting offline DIBATALKAN, agar ia
+// MELEPASKAN/membatalkan booking lokasi (bila sudah ada) dan berhenti mencari venue untuk
+// pertemuan ini. Dipanggil dari cancelDispatch untuk meeting venue-coordinated. TIDAK meminta
+// CONFIRM_VENUE (meeting sudah terminal). Berjalan di goroutine sendiri (ada inject LLM).
+func (h *Handler) dispatchVenueCancellation(meetingID int64, ed meetingDetails, when *time.Time) {
+	lctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	m, err := h.Store.MeetingByID(lctx, meetingID)
+	cancel()
+	if err != nil || m == nil {
+		log.Printf("[VENUE-CANCEL] meeting #%d tidak ditemukan: %v", meetingID, err)
+		return
+	}
+	who := firstNonEmptyStr(m.ExternalName, ed.AttendeeName, "pihak eksternal")
+	prevVenue := firstNonEmptyStr(strings.TrimSpace(m.Venue), ed.VenueName)
+	var b strings.Builder
+	b.WriteString("Pak Sudianto MEMBATALKAN pertemuan tatap muka dengan " + who + ".")
+	if when != nil {
+		b.WriteString(" Jadwal yang dibatalkan: " + formatWIBLong(*when) + ".")
+	}
+	if prevVenue != "" {
+		b.WriteString(" Lokasi yang sudah/sedang dikoordinasikan: " + prevVenue + ".")
+	}
+	b.WriteString(" Mohon LEPASKAN/BATALKAN pemesanan lokasi tersebut bila ada, dan tidak perlu " +
+		"melanjutkan pencarian venue untuk pertemuan ini. Tidak perlu CONFIRM_VENUE. Sampaikan dengan sopan. " +
 		"Tanpa membahas biaya.")
 	h.dispatchNovaVenue(meetingID, b.String())
 }
@@ -1797,9 +1956,23 @@ func (h *Handler) cancelDispatch(initiator *model.Contact, a model.Action) {
 		}
 	}
 
+	// 3) Bila meeting OFFLINE dan Bu Nova SUDAH dilibatkan untuk lokasi, beri tahu ia agar
+	// melepaskan/membatalkan booking dan berhenti mencari venue. Nova baru dihubungi otomatis
+	// SETELAH SU menyetujui waktu (status 'approved' → dispatchVenueCoordination) atau saat
+	// venue sudah dikonfirmasi ('scheduled'/venueConfirmed). Bila meeting masih 'pending',
+	// Nova belum pernah dihubungi → jangan repotkan. NB: m.Status di sini masih nilai SEBELUM
+	// pembatalan (UpdateMeetingStatus di atas hanya mengubah DB, bukan struct lokal). Meeting
+	// kini terminal di DB, jadi bila support keliru emit CONFIRM_VENUE, meeting ini tak ketemu.
+	novaNote := ""
+	novaEngaged := det.VenueCoordination && (det.VenueConfirmed || m.Status == "approved" || m.Status == "scheduled")
+	if novaEngaged {
+		go h.dispatchVenueCancellation(m.ID, det, m.ProposedDatetime)
+		novaNote = " Bu Nova juga diberi tahu untuk melepaskan koordinasi lokasi."
+	}
+
 	who := firstNonEmptyStr(m.ExternalName, det.AttendeeName, "pihak terkait")
-	h.notifySU(fmt.Sprintf("✅ Meeting #%d dengan %s dibatalkan. PA Communicator sudah mengabari pihak terkait%s%s.",
-		m.ID, who, emailNote, calNote))
+	h.notifySU(fmt.Sprintf("✅ Meeting #%d dengan %s dibatalkan. PA Communicator sudah mengabari pihak terkait%s%s.%s",
+		m.ID, who, emailNote, calNote, novaNote))
 }
 
 // requestMeetingChange meneruskan permintaan perubahan jadwal dari pihak eksternal ke Pak Sudianto.
@@ -2183,11 +2356,11 @@ func (h *Handler) notifySUTimeApproval(ctx context.Context, m *model.MeetingRequ
 	if m.ProposedDatetime != nil {
 		when = formatWIBLong(*m.ProposedDatetime)
 	}
-	header := "🔔 *Persetujuan waktu meeting offline diperlukan*"
+	header := "🔔 *Persetujuan waktu meeting OFFLINE diperlukan*"
 	coordNote := "Setelah Anda setujui, Bu Nova akan dikoordinasikan untuk memastikan lokasi, lalu " +
 		"meeting difinalisasi otomatis (tanpa persetujuan lagi)."
 	if rf := strings.TrimSpace(ed.RescheduleFrom); rf != "" {
-		header = "🔔 *Persetujuan reschedule (waktu) meeting offline diperlukan*"
+		header = "🔔 *Persetujuan reschedule (waktu) meeting OFFLINE diperlukan*"
 		coordNote = "Setelah Anda setujui, Bu Nova akan dikoordinasikan ulang untuk lokasi (booking " +
 			"venue & waktu lama akan dibatalkan), lalu jadwal baru difinalisasi otomatis."
 		if oldAt, perr := time.Parse(time.RFC3339, rf); perr == nil {
@@ -2558,8 +2731,8 @@ func (h *Handler) DecideApproval(ctx context.Context, id int64, approve bool) (s
 				}
 				log.Printf("[APPROVAL] #%d (meeting #%d) waktu disetujui — koordinasi venue ke Bu Nova", id, m.ID)
 				return fmt.Sprintf("✅ Approval #%d disetujui — waktu dikonfirmasi. Bu Nova sedang dikoordinasikan "+
-					"untuk lokasi; konfirmasi final (undangan kalender + email + pesan ke pihak eksternal) akan "+
-					"menyusul otomatis setelah lokasi pasti.", id), nil
+					"untuk lokasi; konfirmasi final (entri kalender + pesan ke pihak eksternal) akan menyusul "+
+					"otomatis setelah lokasi pasti. Pihak eksternal akan diminta mengirim undangan/link ke pa@hypernet.co.id.", id), nil
 			}
 			go h.finalizeOfflineMeeting(m.ID)
 			return fmt.Sprintf("✅ Approval #%d disetujui — lokasi sudah pasti, meeting offline sedang difinalisasi.", id), nil
@@ -2624,18 +2797,25 @@ func (h *Handler) scheduleApprovedMeeting(ctx context.Context, approvalID int64)
 // dan finalizeOfflineMeeting (meeting offline, setelah venue pasti). Mengembalikan suffix
 // status. Pemanggil memastikan m.ProposedDatetime != nil & layanan aktif.
 func (h *Handler) createEventAndInvite(ctx context.Context, m *model.MeetingRequest, det meetingDetails, title string, duration int) string {
+	// KEBIJAKAN BARU: untuk meeting yang diinisiasi pihak EKSTERNAL, PIHAK EKSTERNAL yang
+	// mengirim undangan/link meeting ke pa@hypernet.co.id — PA tidak lagi mengundang mereka.
+	// Maka: jangan tambahkan mereka sebagai attendee (agar MS Graph tidak mengirim undangan
+	// kalender), jangan buat Teams link tandingan, dan jangan kirim RSVP. Event kalender
+	// tetap dibuat sebagai entri jadwal Pak Sudianto (dan dasar pengingat).
+	externalHosted := m.RequestedVia == "external"
 	isOnline := strings.TrimSpace(m.Venue) == ""
 	dt := m.ProposedDatetime.Format(time.RFC3339)
 
 	var attendees []string
-	if det.AttendeeEmail != "" {
+	if !externalHosted && det.AttendeeEmail != "" {
 		attendees = append(attendees, det.AttendeeEmail)
 	}
+	createOnline := isOnline && !externalHosted // eksternal: link disiapkan pihak eksternal
 
-	// 1) Buat Calendar event (online → dapat Teams joinUrl otomatis).
+	// 1) Buat Calendar event (online non-eksternal → dapat Teams joinUrl otomatis).
 	ev, err := h.Services.CreateEvent(ctx, services.CreateEventReq{
 		Title: title, Datetime: dt, DurationMinutes: duration, Venue: m.Venue,
-		Attendees: attendees, IsOnline: isOnline,
+		Attendees: attendees, IsOnline: createOnline,
 	})
 	if err != nil {
 		log.Printf("[SCHEDULE] buat event meeting #%d gagal: %v", m.ID, err)
@@ -2644,11 +2824,15 @@ func (h *Handler) createEventAndInvite(ctx context.Context, m *model.MeetingRequ
 	det.EventID = ev.EventID
 	det.CalendarLink = ev.CalendarLink
 	det.TeamsLink = ev.OnlineMeetingURL
-	log.Printf("[SCHEDULE] meeting #%d event=%s teams=%s", m.ID, ev.EventID, ev.OnlineMeetingURL)
+	log.Printf("[SCHEDULE] meeting #%d event=%s teams=%s external=%v", m.ID, ev.EventID, ev.OnlineMeetingURL, externalHosted)
 
-	// 2) Kirim RSVP email ke kontak (bila email diketahui).
+	// 2) Undangan email.
 	emailNote := ""
-	if det.AttendeeEmail != "" {
+	switch {
+	case externalHosted:
+		// Pihak eksternal yang mengirim undangan/link ke pa@hypernet.co.id (bukan PA).
+		emailNote = " (pihak eksternal diminta mengirim undangan/link meeting ke pa@hypernet.co.id)"
+	case det.AttendeeEmail != "":
 		if err := h.Services.SendRSVP(ctx, services.RSVPReq{
 			To: det.AttendeeEmail, ToName: firstNonEmptyStr(det.AttendeeName, m.ExternalName, det.AttendeeEmail),
 			Title: title, Datetime: dt, DurationMinutes: duration, Venue: m.Venue,
@@ -2659,7 +2843,7 @@ func (h *Handler) createEventAndInvite(ctx context.Context, m *model.MeetingRequ
 		} else {
 			log.Printf("[SCHEDULE] RSVP terkirim ke %s meeting #%d", det.AttendeeEmail, m.ID)
 		}
-	} else {
+	default:
 		emailNote = " (email kontak tidak diketahui, undangan tidak dikirim)"
 	}
 
@@ -2668,18 +2852,16 @@ func (h *Handler) createEventAndInvite(ctx context.Context, m *model.MeetingRequ
 	if err := h.Store.ScheduleMeeting(ctx, m.ID, newDetails, "su", "dijadwalkan otomatis via Fase 9"); err != nil {
 		log.Printf("[SCHEDULE] tandai scheduled meeting #%d gagal: %v", m.ID, err)
 	}
-	// Pengingat otomatis beberapa menit sebelum meeting mulai.
+	// Pengingat otomatis beberapa menit sebelum meeting mulai (SU + pihak eksternal).
 	h.scheduleMeetingReminder(ctx, m, det)
 	return fmt.Sprintf("\n📅 Meeting dijadwalkan (event kalender dibuat)%s.", emailNote)
 }
 
-// finalizeOfflineMeeting menuntaskan meeting offline SETELAH lokasi dikonfirmasi Bu Nova —
-// TANPA persetujuan SU kedua. Prasyarat: waktu sudah disetujui SU (status 'approved'),
-// timeAgreed & venueConfirmed true, dan ada waktu. Mengirim konfirmasi MENYELURUH (waktu +
-// lokasi) ke pihak eksternal, membuat/PATCH event kalender + undangan email, menandai
-// 'scheduled', menjadwalkan pengingat, lalu memberi tahu SU. Idempoten (dilewati bila sudah
-// 'scheduled') dan menahan diri bila prasyarat belum terpenuhi. Membuat context sendiri
-// karena bisa dipanggil dari goroutine/inbound.
+// finalizeOfflineMeeting menyelesaikan meeting offline setelah lokasi dikonfirmasi —
+// tanpa persetujuan SU kedua. Syarat: status 'approved', timeAgreed & venueConfirmed true,
+// dan ada waktu. Mengirim konfirmasi (waktu+loka si), buat/patch event kalender + undangan,
+// tandai 'scheduled', jadwalkan pengingat, dan beri tahu SU. Idempoten dan membuat context
+// sendiri (dipanggil dari goroutine/inbound).
 func (h *Handler) finalizeOfflineMeeting(meetingID int64) {
 	if h.Store == nil {
 		return
@@ -2722,7 +2904,8 @@ func (h *Handler) finalizeOfflineMeeting(meetingID int64) {
 			greet = "Halo " + who
 		}
 		extMsg := fmt.Sprintf("%s, pertemuan dengan Pak Sudianto sudah dikonfirmasi sepenuhnya:\n"+
-			"🗓️ %s\n📍 %s\nTopik: %s.\nSampai jumpa di sana, terima kasih. 🙏",
+			"🗓️ %s\n📍 %s\nTopik: %s.\n\nBila ada undangan/agenda meeting, mohon dikirimkan ke email kami "+
+			"di pa@hypernet.co.id ya. Sampai jumpa di sana, terima kasih. 🙏",
 			greet, formatWIBLong(*m.ProposedDatetime), m.Venue, title)
 		agentID := firstNonEmptyStr(m.AgentID, "pa_communicator")
 		h.sendAndRecord(ctx, func() error { return h.Waha.SendToChat(externalChat, extMsg) },
@@ -2751,7 +2934,7 @@ func (h *Handler) finalizeOfflineMeeting(meetingID int64) {
 
 	// 3) Beri tahu SU bahwa meeting sudah terkonfirmasi lengkap.
 	who := firstNonEmptyStr(det.AttendeeName, m.ExternalName, "pihak terkait")
-	h.notifySU(fmt.Sprintf("✅ Meeting offline #%d dengan %s telah dikonfirmasi lengkap — 🗓️ %s 📍 %s.%s",
+	h.notifySU(fmt.Sprintf("✅ Meeting offline #%d dengan %s telah dikonfirmasi lengkap — \n\n 🗓️ %s \n📍 %s.%s",
 		m.ID, who, formatWIBLong(*m.ProposedDatetime), m.Venue, suffix))
 	log.Printf("[VENUE-FINAL] meeting #%d difinalisasi (venue=%q)", m.ID, m.Venue)
 }
@@ -2816,8 +2999,13 @@ func (h *Handler) finalizeReschedule(ctx context.Context, m *model.MeetingReques
 	}
 	log.Printf("[RESCHEDULE] meeting #%d event %s diperbarui ke %s", m.ID, det.EventID, dtNew)
 
+	// KEBIJAKAN BARU: meeting yang diinisiasi pihak eksternal → pihak eksternal yang
+	// memperbarui undangan/link ke pa@hypernet.co.id; PA tidak mengirim email jadwal baru.
 	emailNote := ""
-	if det.AttendeeEmail != "" {
+	switch {
+	case m.RequestedVia == "external":
+		emailNote = " (pihak eksternal diminta memperbarui undangan/link ke pa@hypernet.co.id)"
+	case det.AttendeeEmail != "":
 		if serr := h.Services.SendReschedule(ctx, services.RescheduleReq{
 			To: det.AttendeeEmail, ToName: firstNonEmptyStr(det.AttendeeName, m.ExternalName, det.AttendeeEmail),
 			Title: title, OldDatetime: det.RescheduleFrom, NewDatetime: dtNew,
@@ -2828,7 +3016,7 @@ func (h *Handler) finalizeReschedule(ctx context.Context, m *model.MeetingReques
 		} else {
 			log.Printf("[RESCHEDULE] email reschedule terkirim ke %s meeting #%d", det.AttendeeEmail, m.ID)
 		}
-	} else {
+	default:
 		emailNote = " (email kontak tidak diketahui)"
 	}
 

@@ -191,6 +191,65 @@ func (h *AdminHandler) BlockExternal(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "blocked", "identifier": c.Param("identifier")})
 }
 
+// UnblockExternal: POST /admin/external/:identifier/unblock  — batalkan blokir (kembali 'pending').
+func (h *AdminHandler) UnblockExternal(c *gin.Context) {
+	var body struct {
+		Notes string `json:"notes"`
+	}
+	_ = c.ShouldBindJSON(&body)
+	err := h.Store.SetExternalStatus(c.Request.Context(), c.Param("identifier"), "pending", body.Notes)
+	if errors.Is(err, db.ErrNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "external contact tidak ditemukan"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "unblocked", "identifier": c.Param("identifier")})
+}
+
+// ─── Block/unblock cepat by phone (mode open) ─────────────────────
+
+// BlockPhone: POST /admin/block  body {"phone":"628xxx","notes":"..."}
+// Blokir menyeluruh untuk WHITELIST_MODE=open: cabut dari whitelist + tandai
+// 'blocked' di external_contacts (bentuk @c.us dan @lid). Satu panggilan.
+func (h *AdminHandler) BlockPhone(c *gin.Context) {
+	var body struct {
+		Phone string `json:"phone"`
+		Notes string `json:"notes"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Phone == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "field 'phone' wajib diisi"})
+		return
+	}
+	blocked, err := h.Store.BlockContactByPhone(c.Request.Context(), body.Phone, body.Notes)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "blocked", "phone": body.Phone, "identifiers": blocked})
+}
+
+// UnblockPhone: POST /admin/unblock  body {"phone":"628xxx"}
+// Batalkan blokir by phone (kembalikan 'pending'). Di mode open, pesan berikutnya
+// akan auto-whitelist ulang.
+func (h *AdminHandler) UnblockPhone(c *gin.Context) {
+	var body struct {
+		Phone string `json:"phone"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Phone == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "field 'phone' wajib diisi"})
+		return
+	}
+	unblocked, err := h.Store.UnblockContactByPhone(c.Request.Context(), body.Phone)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "unblocked", "phone": body.Phone, "identifiers": unblocked})
+}
+
 // PromoteExternal: POST /admin/external/:identifier/promote  — pindahkan ke whitelist.
 func (h *AdminHandler) PromoteExternal(c *gin.Context) {
 	var in db.ContactInput

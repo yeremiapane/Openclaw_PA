@@ -53,7 +53,12 @@ type LidResolver interface {
 // Auth adalah middleware pertama: parse payload, filter event message,
 // cek whitelist, dan catat kontak eksternal. `lids` boleh nil (fallback resolusi
 // LID→nomor lewat WAHA dilewati).
-func Auth(store *db.Store, lids LidResolver) gin.HandlerFunc {
+//
+// openMode=true (WHITELIST_MODE=open): nomor TAK DIKENAL otomatis di-whitelist
+// sebagai 'external' (dilayani pa_communicator) alih-alih diblokir — KECUALI yang
+// telah ditandai 'blocked' oleh admin di external_contacts (mitigasi tetap jalan).
+// openMode=false (strict, default): perilaku lama — nomor tak dikenal diblokir.
+func Auth(store *db.Store, lids LidResolver, openMode bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		raw, _ := c.GetRawData()
 		var ev model.WahaEvent
@@ -113,11 +118,60 @@ func Auth(store *db.Store, lids LidResolver) gin.HandlerFunc {
 		if errors.Is(err, db.ErrNotWhitelisted) {
 			// Catat / perbarui jejak kontak external untuk mitigasi.
 			reason := "not_whitelisted"
+			blockedByAdmin := false
 			if ec, uerr := store.UpsertExternalContact(ctx, id); uerr != nil {
 				log.Printf("[ERROR] upsert external (%s): %v", ev.Payload.From, uerr)
 			} else if ec.Status == "blocked" {
 				reason = "external_blocked"
+				blockedByAdmin = true
 			}
+
+			// MODE OPEN: layani nomor tak dikenal dengan auto-whitelist sbg 'external'
+			// — kecuali yang diblokir admin (mitigasi eksplisit tetap diutamakan).
+			if openMode && !blockedByAdmin {
+				// Butuh nomor kanonik (kolom phone NOT NULL). Untuk @lid, pakai hasil
+				// resolusi (lookup) bila ada; bila tak teresolusi, tak bisa dibuat kontak.
+				phone := ""
+				if lookup.Kind == "phone" {
+					phone = lookup.Value
+				}
+				if phone == "" {
+					logAccess(store, ctx, model.AccessLog{
+						Identifier: ev.Payload.From, Kind: id.Kind, Phone: phoneOf(id),
+						Decision: "blocked", Reason: "auto_whitelist_no_phone",
+						BodyPreview: bodyPreview(ev.Payload.Body),
+					})
+					SecurityEvent("whitelist_blocked")
+					log.Printf("[BLOCKED] from=%s (%s:%s) reason=auto_whitelist_no_phone (lid tak teresolusi)",
+						ev.Payload.From, id.Kind, id.Value)
+					c.AbortWithStatusJSON(http.StatusOK, gin.H{"status": "blocked"})
+					return
+				}
+				lidVal := ""
+				if id.Kind == "lid" {
+					lidVal = id.Value
+				}
+				newC, cerr := store.AutoWhitelistExternal(ctx, phone, lidVal)
+				if cerr != nil {
+					log.Printf("[ERROR] auto-whitelist %s gagal: %v", phone, cerr)
+					c.AbortWithStatusJSON(http.StatusOK, gin.H{"status": "error", "reason": "auto whitelist"})
+					return
+				}
+				cid := newC.ID
+				logAccess(store, ctx, model.AccessLog{
+					Identifier: ev.Payload.From, Kind: id.Kind, Phone: newC.Phone,
+					ContactID: &cid, Decision: "allowed", Reason: "auto_whitelist",
+					BodyPreview: bodyPreview(ev.Payload.Body),
+				})
+				SecurityEvent("auto_whitelisted")
+				log.Printf("[AUTO-WL] from=%s → kontak #%d phone=%s trust=external (mode open)",
+					ev.Payload.From, newC.ID, newC.Phone)
+				c.Set(CtxEvent, &ev)
+				c.Set(CtxContact, newC)
+				c.Next()
+				return
+			}
+
 			logAccess(store, ctx, model.AccessLog{
 				Identifier: ev.Payload.From, Kind: id.Kind, Phone: phoneOf(id),
 				Decision: "blocked", Reason: reason, BodyPreview: bodyPreview(ev.Payload.Body),

@@ -1,0 +1,227 @@
+{
+  "uid": "pa-security",
+  "title": "PA AI — Keamanan",
+  "tags": ["pa-ai", "fase-m3"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Ringkasan (rentang waktu)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Injeksi Diblokir",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 1 },
+      "datasource": { "type": "postgres", "uid": "pa_postgres" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "postgres", "uid": "pa_postgres" }, "format": "table", "rawQuery": true, "rawSql": "SELECT count(*) AS n FROM access_logs WHERE $__timeFilter(created_at) AND decision = 'injection_blocked'" }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background", "graphMode": "none" }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Diblokir Whitelist",
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 1 },
+      "datasource": { "type": "postgres", "uid": "pa_postgres" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "postgres", "uid": "pa_postgres" }, "format": "table", "rawQuery": true, "rawSql": "SELECT count(*) AS n FROM access_logs WHERE $__timeFilter(created_at) AND decision = 'blocked'" }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 10 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none" }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Rate-limited",
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 1 },
+      "datasource": { "type": "postgres", "uid": "pa_postgres" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "postgres", "uid": "pa_postgres" }, "format": "table", "rawQuery": true, "rawSql": "SELECT count(*) AS n FROM access_logs WHERE $__timeFilter(created_at) AND decision = 'rate_limited'" }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none" }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Gagal Auth Admin",
+      "gridPos": { "h": 5, "w": 4, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(increase(gateway_security_events_total{kind=\"admin_auth_failed\"}[$__range]))", "instant": true }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background", "graphMode": "none" }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Refusal Agent",
+      "gridPos": { "h": 5, "w": 4, "x": 16, "y": 1 },
+      "datasource": { "type": "postgres", "uid": "pa_postgres" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "postgres", "uid": "pa_postgres" }, "format": "table", "rawQuery": true, "rawSql": "SELECT count(*) AS n FROM agent_executions WHERE $__timeFilter(created_at) AND refusal" }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none" }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Outbound Tertahan (held)",
+      "gridPos": { "h": 5, "w": 4, "x": 20, "y": 1 },
+      "datasource": { "type": "postgres", "uid": "pa_postgres" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "postgres", "uid": "pa_postgres" }, "format": "table", "rawQuery": true, "rawSql": "SELECT count(*) AS n FROM outbound_messages WHERE $__timeFilter(created_at) AND status = 'held'" }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none" }
+    },
+    {
+      "id": 200,
+      "type": "row",
+      "title": "Tren",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Peristiwa Keamanan per Jenis (real-time, /s)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (kind) (rate(gateway_security_events_total[5m]))", "legendFormat": "{{kind}}" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 15, "showPoints": "auto" }, "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum", "max"] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Keputusan Security Layer per Waktu (access_logs)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "datasource": { "type": "postgres", "uid": "pa_postgres" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "postgres", "uid": "pa_postgres" }, "format": "time_series", "rawQuery": true, "rawSql": "SELECT $__timeGroupAlias(created_at, $__interval), decision AS metric, count(*) AS value FROM access_logs WHERE $__timeFilter(created_at) GROUP BY 1, decision ORDER BY 1" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 60, "stacking": { "mode": "normal" } }, "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum"] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Outbound: sent / held / failed (approval gate)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "datasource": { "type": "postgres", "uid": "pa_postgres" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "postgres", "uid": "pa_postgres" }, "format": "time_series", "rawQuery": true, "rawSql": "SELECT $__timeGroupAlias(created_at, $__interval), status AS metric, count(*) AS value FROM outbound_messages WHERE $__timeFilter(created_at) GROUP BY 1, status ORDER BY 1" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 60, "stacking": { "mode": "normal" } }, "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum"] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "Peristiwa Keamanan Terbaru (access_logs)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "datasource": { "type": "postgres", "uid": "pa_postgres" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "postgres", "uid": "pa_postgres" }, "format": "table", "rawQuery": true, "rawSql": "SELECT created_at AS \"Waktu\", decision AS \"Keputusan\", COALESCE(reason,'') AS \"Alasan\", COALESCE(phone, identifier) AS \"Dari\", COALESCE(body_preview,'') AS \"Cuplikan\" FROM access_logs WHERE $__timeFilter(created_at) AND decision <> 'allowed' ORDER BY created_at DESC LIMIT 50" }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "options": { "showHeader": true, "sortBy": [ { "displayName": "Waktu", "desc": true } ] }
+    },
+    {
+      "id": 300,
+      "type": "row",
+      "title": "Auto-whitelist & Whitelist (Mode Open)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "collapsed": false
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Auto-whitelist (rentang)",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(increase(gateway_security_events_total{kind=\"auto_whitelisted\"}[$__range]))", "instant": true }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 20 }, { "color": "red", "value": 100 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area" }
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Whitelist Aktif (total)",
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 24 },
+      "datasource": { "type": "postgres", "uid": "pa_postgres" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "postgres", "uid": "pa_postgres" }, "format": "table", "rawQuery": true, "rawSql": "SELECT count(*) AS n FROM contacts WHERE deleted_at IS NULL" }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "blue", "value": null } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none" }
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Terblokir (total)",
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 24 },
+      "datasource": { "type": "postgres", "uid": "pa_postgres" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "postgres", "uid": "pa_postgres" }, "format": "table", "rawQuery": true, "rawSql": "SELECT count(*) AS n FROM external_contacts WHERE status = 'blocked' AND deleted_at IS NULL" }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none" }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Auto-whitelist per Waktu (/s)",
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(gateway_security_events_total{kind=\"auto_whitelisted\"}[5m]))", "legendFormat": "auto-whitelist/s" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 20, "showPoints": "auto" }, "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 15,
+      "type": "table",
+      "title": "Kontak Whitelist (aktif)",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 29 },
+      "datasource": { "type": "postgres", "uid": "pa_postgres" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "postgres", "uid": "pa_postgres" }, "format": "table", "rawQuery": true, "rawSql": "SELECT phone AS \"Nomor\", COALESCE(name,'') AS \"Nama\", trust_level AS \"Trust\", created_at AS \"Sejak\" FROM contacts WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 200" }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "options": { "showHeader": true, "sortBy": [ { "displayName": "Sejak", "desc": true } ] }
+    },
+    {
+      "id": 16,
+      "type": "table",
+      "title": "Nomor Terblokir (external_contacts)",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 29 },
+      "datasource": { "type": "postgres", "uid": "pa_postgres" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "postgres", "uid": "pa_postgres" }, "format": "table", "rawQuery": true, "rawSql": "SELECT identifier AS \"Identifier\", COALESCE(phone,'') AS \"Nomor\", COALESCE(lid,'') AS \"LID\", last_seen AS \"Terakhir\", COALESCE(notes,'') AS \"Catatan\" FROM external_contacts WHERE status = 'blocked' AND deleted_at IS NULL ORDER BY last_seen DESC LIMIT 200" }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "options": { "showHeader": true, "sortBy": [ { "displayName": "Terakhir", "desc": true } ] }
+    }
+  ]
+}

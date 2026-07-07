@@ -28,6 +28,16 @@ groups:
           summary: "Percobaan akses admin gagal"
           description: "Ada request ke /admin/* dengan X-Admin-Key salah/absen."
 
+      # Hanya relevan saat WHITELIST_MODE=open. Lonjakan tak wajar bisa berarti spam/
+      # abuse penelepon baru. Ambang indikatif — sesuaikan dgn volume normal Anda.
+      - alert: LonjakanAutoWhitelist
+        expr: sum(increase(gateway_security_events_total{kind="auto_whitelisted"}[15m])) > 30
+        for: 0m
+        labels: { severity: warning, pilar: keamanan }
+        annotations:
+          summary: "Lonjakan auto-whitelist (mode open)"
+          description: ">30 nomor baru otomatis di-whitelist dalam 15 menit — kemungkinan spam/abuse. Tinjau & blokir bila perlu (POST /admin/block)."
+
   - name: kesehatan
     rules:
       - alert: GatewayDown
@@ -53,3 +63,90 @@ groups:
         annotations:
           summary: "Error rate 5xx > 5%"
           description: "Gateway mengembalikan >5% error 5xx selama 5 menit."
+
+  # ─── Fase M4 — Operasional (WhatsApp & tugas terjadwal) ──────────────
+  - name: operasional
+    rules:
+      - alert: SesiWahaDown
+        expr: gateway_waha_session_up == 0
+        for: 3m
+        labels: { severity: critical, pilar: operasional }
+        annotations:
+          summary: "Sesi WhatsApp (WAHA) tidak WORKING"
+          description: "Sesi WAHA bukan WORKING >3 menit — bot tak bisa kirim/terima WhatsApp (mungkin perlu scan QR / restart)."
+
+      - alert: WahaTakTerjangkau
+        expr: gateway_waha_reachable == 0
+        for: 3m
+        labels: { severity: critical, pilar: operasional }
+        annotations:
+          summary: "Endpoint WAHA tak terjangkau"
+          description: "Gateway tak bisa menghubungi WAHA >3 menit (container WAHA mati / jaringan putus)."
+
+      - alert: TugasTerjadwalError
+        expr: gateway_scheduled_tasks{status="error"} > 0
+        for: 0m
+        labels: { severity: warning, pilar: operasional }
+        annotations:
+          summary: "Ada tugas terjadwal gagal terkirim"
+          description: "{{ $value }} pengingat/digest berstatus 'error' (gagal kirim ke SU). Periksa log scheduler."
+
+      - alert: ApprovalMenumpuk
+        expr: gateway_pending_approvals > 10
+        for: 2h
+        labels: { severity: warning, pilar: operasional }
+        annotations:
+          summary: "Approval menunggu menumpuk"
+          description: ">10 pesan keluar menunggu persetujuan SU selama >2 jam."
+
+      - alert: PengirimanKeluarGagal
+        expr: sum(increase(gateway_outbound_messages_total{status="failed"}[10m])) > 3
+        for: 0m
+        labels: { severity: warning, pilar: operasional }
+        annotations:
+          summary: "Pengiriman WhatsApp keluar gagal"
+          description: ">3 pesan keluar gagal terkirim dalam 10 menit (WAHA menolak / jaringan)."
+
+      - alert: WorkerLatarBasi
+        expr: time() - gateway_worker_last_run_timestamp_seconds > 600
+        for: 0m
+        labels: { severity: critical, pilar: operasional }
+        annotations:
+          summary: "Worker latar berhenti berdetak"
+          description: "Worker {{ $labels.worker }} tak menyelesaikan siklus >10 menit (goroutine mati/macet)."
+
+  # ─── Fase M5 — Agent / LLM ───────────────────────────────────────────
+  - name: agent
+    rules:
+      - alert: LonjakanParseError
+        expr: sum(increase(gateway_agent_calls_total{outcome="parse_error"}[15m])) > 3
+        for: 0m
+        labels: { severity: warning, pilar: agent }
+        annotations:
+          summary: "Lonjakan parse_error agent"
+          description: ">3 giliran agent berujung parse_error dalam 15 menit (kemungkinan kontaminasi sesi OpenClaw — sesi terjebak prosa)."
+
+      - alert: LonjakanFallbackModel
+        expr: sum(increase(gateway_agent_fallbacks_total[15m])) > 5
+        for: 0m
+        labels: { severity: warning, pilar: agent }
+        annotations:
+          summary: "Sering memakai model fallback"
+          description: ">5 giliran memakai model fallback dalam 15 menit (model utama bermasalah / rate-limit)."
+
+      - alert: AgentLatensiTinggi
+        expr: histogram_quantile(0.95, sum by (le, agent) (rate(gateway_agent_duration_seconds_bucket[10m]))) > 60
+        for: 10m
+        labels: { severity: warning, pilar: agent }
+        annotations:
+          summary: "Latensi agent p95 > 60 dtk"
+          description: "Agent {{ $labels.agent }} p95 > 60 dtk selama 10 menit (LLM lambat / antre)."
+
+      # Ambang token harian bersifat indikatif — sesuaikan dengan anggaran nyata.
+      - alert: PemakaianTokenHarianTinggi
+        expr: sum(increase(gateway_agent_tokens_total{type=~"input|output"}[24h])) > 5000000
+        for: 0m
+        labels: { severity: warning, pilar: api }
+        annotations:
+          summary: "Pemakaian token 24 jam tinggi"
+          description: ">5 juta token (input+output) dalam 24 jam — tinjau pemakaian/biaya."

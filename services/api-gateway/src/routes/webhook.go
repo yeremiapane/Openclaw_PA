@@ -578,6 +578,12 @@ func (h *Handler) logExecution(ctx context.Context, convID, agentID string, cont
 		e.Actions, _ = json.Marshal(reply.Actions)
 		e.NewFacts, _ = json.Marshal(reply.NewFacts)
 	}
+	// Metrik Prometheus (Fase M5): rekam giliran agent (outcome/latensi/token/fallback/
+	// refusal) — independen dari tulis DB agar tetap tercatat walau DB gagal.
+	middleware.RecordAgentCall(agentID, outcome, meta.DurationMs,
+		meta.Usage.Input, meta.Usage.Output, meta.Usage.CacheRead, meta.Usage.CacheWrite,
+		meta.FallbackUsed, meta.Refusal)
+
 	id, err := h.Store.CreateExecution(ctx, e)
 	if err != nil {
 		log.Printf("[OBS] log execution gagal conv=%s: %v", convID, err)
@@ -604,6 +610,8 @@ func (h *Handler) sendAndRecord(ctx context.Context, sendFn func() error, o mode
 	if o.Status == "" {
 		o.Status = "sent"
 	}
+	// Metrik Prometheus (Fase M5): hitung pesan keluar per jenis & status.
+	middleware.RecordOutbound(o.Kind, o.Status)
 	if _, err := h.Store.LogOutbound(ctx, o); err != nil {
 		log.Printf("[OBS] log outbound gagal: %v", err)
 	}

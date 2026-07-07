@@ -1,0 +1,19 @@
+# Alertmanager (Fase M3b) — meneruskan alert ke webhook gateway yang mengirim email.
+# Token Bearer dibaca dari file (credentials_file) agar TIDAK tersimpan di repo;
+# isi file = ALERT_WEBHOOK_TOKEN di .env. Lihat monitoring/README.md.
+route:
+  receiver: gateway-email
+  group_by: ["alertname"]
+  group_wait: 30s      # tunggu 30s untuk mengelompokkan alert sejenis
+  group_interval: 5m   # jeda antar batch untuk grup yang sama
+  repeat_interval: 3h  # ulangi notifikasi bila masih firing
+
+receivers:
+  - name: gateway-email
+    webhook_configs:
+      - url: http://host.docker.internal:4000/internal/alerts
+        send_resolved: true
+        http_config:
+          authorization:
+            type: Bearer
+            credentials_file: /etc/alertmanager/webhook_token

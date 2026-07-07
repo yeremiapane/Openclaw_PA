@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -40,6 +41,12 @@ type Config struct {
 	RateLimitWindow time.Duration // panjang window rate limit
 	MaxMsgLen       int           // batas panjang body pesan
 	AdminAPIKey     string        // melindungi endpoint /admin/*
+	// WhitelistMode mengatur perlakuan nomor TAK DIKENAL:
+	//   "strict" (default) — hanya kontak whitelist yang dilayani; sisanya diblokir.
+	//   "open"             — semua penelepon otomatis di-whitelist sbg 'external' &
+	//                        dilayani pa_communicator (kecuali yang diblokir admin).
+	// SU & Nova tetap bersumber dari .env (di-seed) apa pun modenya.
+	WhitelistMode string
 
 	// Alerting (Fase M3b): Alertmanager -> webhook gateway -> email via MS Graph.
 	AlertEmailTo      string // tujuan notifikasi alert keamanan/kesehatan
@@ -113,6 +120,7 @@ func Load() Config {
 		RateLimitWindow: time.Duration(getenvInt("RATE_LIMIT_WINDOW_SEC", 60)) * time.Second,
 		MaxMsgLen:       getenvInt("MAX_MSG_LEN", 2000),
 		AdminAPIKey:     getenv("ADMIN_API_KEY", ""),
+		WhitelistMode:   normalizeWhitelistMode(getenv("WHITELIST_MODE", "strict")),
 
 		AlertEmailTo:      getenv("ALERT_EMAIL_TO", "yeremia.yosefan@hypernet.co.id"),
 		AlertWebhookToken: getenv("ALERT_WEBHOOK_TOKEN", ""),
@@ -142,7 +150,26 @@ func Load() Config {
 	if cfg.MSGraphTenantID == "" || cfg.MSGraphClientID == "" || cfg.MSGraphClientSecret == "" || cfg.MSGraphUserUPN == "" {
 		log.Println("[config] PERINGATAN: kredensial MS Graph belum lengkap — penjadwalan meeting (Calendar/Email) nonaktif")
 	}
+	if cfg.WhitelistMode == "open" {
+		log.Println("[config] WHITELIST_MODE=open — SEMUA nomor tak dikenal akan otomatis di-whitelist & dilayani pa_communicator (kecuali yang diblokir admin).")
+	} else {
+		log.Println("[config] WHITELIST_MODE=strict — hanya kontak whitelist yang dilayani.")
+	}
 	return cfg
+}
+
+// normalizeWhitelistMode memvalidasi nilai WHITELIST_MODE. Nilai tak dikenal
+// jatuh ke "strict" (default aman) disertai peringatan.
+func normalizeWhitelistMode(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "open":
+		return "open"
+	case "strict", "":
+		return "strict"
+	default:
+		log.Printf("[config] WHITELIST_MODE=%q tak dikenal — pakai \"strict\"", v)
+		return "strict"
+	}
 }
 
 func getenv(key, fallback string) string {

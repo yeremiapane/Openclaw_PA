@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"pa-ai/api-gateway/src/db"
+	"pa-ai/api-gateway/src/middleware"
 	"pa-ai/api-gateway/src/model"
 	"pa-ai/api-gateway/src/services"
 )
@@ -39,6 +40,7 @@ func (h *Handler) StartEmailWatcher(ctx context.Context) {
 	}
 	log.Printf("[EMAILWATCH] worker pantauan email aktif (poll tiap %s)", emailWatchPoll)
 
+	middleware.WorkerHeartbeat("email_watcher") // emit awal agar seri muncul segera
 	t := time.NewTicker(emailWatchPoll)
 	go func() {
 		defer t.Stop()
@@ -49,6 +51,7 @@ func (h *Handler) StartEmailWatcher(ctx context.Context) {
 				return
 			case <-t.C:
 				h.runEmailWatches(context.Background())
+				middleware.WorkerHeartbeat("email_watcher") // Fase M5: bukti loop hidup
 			}
 		}
 	}()
@@ -472,8 +475,8 @@ func describeReadScope(scope string, pf model.EmailWatch) string {
 	return strings.Join(parts, ", ")
 }
 
-	// watchEmail menjalankan action WATCH_EMAIL dengan kriteria bahasa alami.
-	// Hanya untuk inisiator dengan trust level 'su'. Disimpan sebagai email_watches.
+// watchEmail menjalankan action WATCH_EMAIL dengan kriteria bahasa alami.
+// Hanya untuk inisiator dengan trust level 'su'. Disimpan sebagai email_watches.
 func (h *Handler) watchEmail(ctx context.Context, initiator *model.Contact, a model.Action) {
 	if initiator == nil || initiator.TrustLevel != "su" {
 		trust := "(nil)"

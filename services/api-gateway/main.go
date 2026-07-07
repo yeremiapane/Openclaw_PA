@@ -1,6 +1,6 @@
 // API Gateway — single entry/exit point untuk PA AI System.
-// Fase 3: webhook receiver (WAHA), /health, helper kirim ke WAHA, bootstrap session.
-// Fase 4: security layer (whitelist -> rate limit -> sanitizer) di depan handler.
+// webhook receiver (WAHA), /health, helper kirim ke WAHA, bootstrap session.
+// security layer (whitelist -> rate limit -> sanitizer) di depan handler.
 package main
 
 import (
@@ -69,16 +69,19 @@ func main() {
 	h := &routes.Handler{Waha: wahaClient, Store: store, OpenClaw: openClawClient, Memory: mem, Services: svcClient, SUPhone: cfg.SUPhone, NovaPhone: cfg.NovaPhone, ReminderLeadMinutes: cfg.ReminderLeadMinutes, AlertEmailTo: cfg.AlertEmailTo, AlertWebhookToken: cfg.AlertWebhookToken}
 	admin := &routes.AdminHandler{Store: store, Gateway: h}
 
-	// --- Worker pengingat (Fase A): kirim tugas terjadwal ke SU saat jatuh tempo ---
+	// --- Worker pengingat: kirim tugas terjadwal ke SU saat jatuh tempo ---
 	h.StartScheduler(ctx)
 
-	// --- Worker pantauan email (Fitur E): periksa inbox berkala, lapor email yang cocok ---
+	// --- Worker pantauan email: periksa inbox berkala, lapor email yang cocok ---
 	h.StartEmailWatcher(ctx)
+
+	// --- Kolektor metrik operasional
+	h.StartHealthCollector(ctx)
 
 	r := gin.Default()
 
-	// Instrumentasi Prometheus (Fase M1): catat jumlah & durasi tiap request, lalu
-	// ekspos di /metrics untuk di-scrape. Dipasang paling awal agar semua rute tercakup.
+	// Instrumentasi Prometheus: catat jumlah & durasi tiap request, lalu
+	// ekspos di /metrics untuk di-scrape.
 	r.Use(middleware.Metrics())
 	r.GET("/metrics", middleware.MetricsHandler())
 
@@ -99,7 +102,7 @@ func main() {
 	webhook := r.Group("/webhook")
 	{
 		webhook.POST("/waha",
-			middleware.Auth(store, wahaClient),
+			middleware.Auth(store, wahaClient, cfg.WhitelistMode == "open"),
 			middleware.RateLimit(limiter, store),
 			middleware.Sanitize(cfg.MaxMsgLen, store),
 			h.WahaInbound,
@@ -108,7 +111,7 @@ func main() {
 		webhook.POST("/openclaw-output", h.OpenClawOutput)
 	}
 
-	// Webhook Alertmanager (Fase M3b): relay alert -> email. Auth Bearer token
+	// Webhook Alertmanager: relay alert -> email. Auth Bearer token
 	// sendiri (ALERT_WEBHOOK_TOKEN), bukan X-Admin-Key. Nonaktif bila token kosong.
 	r.POST("/internal/alerts", h.AlertWebhook)
 
@@ -125,7 +128,12 @@ func main() {
 		adminGrp.PATCH("/external/:identifier", admin.UpdateExternal)
 		adminGrp.DELETE("/external/:identifier", admin.DeleteExternal)
 		adminGrp.POST("/external/:identifier/block", admin.BlockExternal)
+		adminGrp.POST("/external/:identifier/unblock", admin.UnblockExternal)
 		adminGrp.POST("/external/:identifier/promote", admin.PromoteExternal)
+
+		// Block/unblock cepat by phone (mode open) — satu panggilan menutup semua jalur.
+		adminGrp.POST("/block", admin.BlockPhone)
+		adminGrp.POST("/unblock", admin.UnblockPhone)
 
 		adminGrp.GET("/logs", admin.ListLogs)
 

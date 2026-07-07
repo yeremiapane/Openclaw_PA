@@ -254,6 +254,101 @@ func (s *Store) SetExternalStatus(ctx context.Context, identifier, status, notes
 	return nil
 }
 
+// lidByPhone mengambil LID kontak berdasarkan nomor, termasuk yang sudah
+// soft-delete (agar block/unblock tetap menemukan bentuk identifier @lid).
+// Mengembalikan "" bila kontak tak ada / tak punya lid.
+func (s *Store) lidByPhone(ctx context.Context, phone string) string {
+	var lid string
+	err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(lid,'') FROM contacts
+		WHERE phone=$1 ORDER BY deleted_at NULLS FIRST LIMIT 1`, phone).Scan(&lid)
+	if err != nil {
+		return ""
+	}
+	return lid
+}
+
+// blockExternalIdentifier menandai satu identifier 'blocked' di external_contacts,
+// membuat barisnya bila belum ada (upsert). Dipakai block cepat mode open.
+func (s *Store) blockExternalIdentifier(ctx context.Context, identifier, kind, phone, lid, notes string) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO external_contacts (identifier, kind, phone, lid, status, notes, message_count, last_seen)
+		VALUES ($1,$2,$3,$4,'blocked',$5,0, now())
+		ON CONFLICT (identifier) DO UPDATE
+		   SET status     = 'blocked',
+		       notes      = COALESCE($5, external_contacts.notes),
+		       deleted_at = NULL`,
+		identifier, kind, nullStr(phone), nullStr(lid), nullStr(notes))
+	return err
+}
+
+// BlockContactByPhone memblokir sebuah nomor secara menyeluruh untuk mode open:
+//  1. soft-delete kontak whitelist (agar tak lagi dilayani auto-whitelist), dan
+//  2. tandai 'blocked' di external_contacts untuk SEMUA bentuk identifier yang
+//     dikenal (<phone>@c.us, dan <lid>@lid bila kontak punya lid) sehingga
+//     pesan berikutnya tetap tertolak apa pun jalur masuknya.
+//
+// Idempotent & aman dipanggil untuk nomor yang belum pernah di-whitelist
+// (mem-blokir preemptif). Mengembalikan daftar identifier yang diblokir.
+func (s *Store) BlockContactByPhone(ctx context.Context, phone, notes string) ([]string, error) {
+	phone = strings.TrimSpace(phone)
+	if phone == "" {
+		return nil, errors.New("phone kosong")
+	}
+	lid := s.lidByPhone(ctx, phone)
+
+	// Cabut dari whitelist (best-effort; abaikan bila memang belum ada).
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE contacts SET deleted_at=now() WHERE phone=$1 AND deleted_at IS NULL`, phone); err != nil {
+		return nil, err
+	}
+
+	blocked := []string{}
+	cusID := phone + "@c.us"
+	if err := s.blockExternalIdentifier(ctx, cusID, "phone", phone, lid, notes); err != nil {
+		return nil, err
+	}
+	blocked = append(blocked, cusID)
+	if lid != "" {
+		lidID := lid + "@lid"
+		if err := s.blockExternalIdentifier(ctx, lidID, "lid", phone, lid, notes); err != nil {
+			return nil, err
+		}
+		blocked = append(blocked, lidID)
+	}
+	return blocked, nil
+}
+
+// UnblockContactByPhone membalik BlockContactByPhone: hapus status 'blocked'
+// (kembalikan ke 'pending') pada external_contacts untuk <phone>@c.us dan
+// <lid>@lid. TIDAK otomatis mem-whitelist ulang; di mode open pesan berikutnya
+// dari nomor itu akan auto-whitelist seperti biasa. Mengembalikan identifier
+// yang berhasil di-unblock.
+func (s *Store) UnblockContactByPhone(ctx context.Context, phone string) ([]string, error) {
+	phone = strings.TrimSpace(phone)
+	if phone == "" {
+		return nil, errors.New("phone kosong")
+	}
+	lid := s.lidByPhone(ctx, phone)
+
+	ids := []string{phone + "@c.us"}
+	if lid != "" {
+		ids = append(ids, lid+"@lid")
+	}
+	unblocked := []string{}
+	for _, id := range ids {
+		ct, err := s.pool.Exec(ctx,
+			`UPDATE external_contacts SET status='pending' WHERE identifier=$1 AND status='blocked'`, id)
+		if err != nil {
+			return nil, err
+		}
+		if ct.RowsAffected() > 0 {
+			unblocked = append(unblocked, id)
+		}
+	}
+	return unblocked, nil
+}
+
 // SoftDeleteExternalContact melakukan SOFT-DELETE kontak external (set deleted_at)
 func (s *Store) SoftDeleteExternalContact(ctx context.Context, identifier string) error {
 	ct, err := s.pool.Exec(ctx,

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"pa-ai/api-gateway/src/db"
+	"pa-ai/api-gateway/src/middleware"
 	"pa-ai/api-gateway/src/model"
 	"pa-ai/api-gateway/src/openclaw"
 	"pa-ai/api-gateway/src/services"
@@ -42,6 +43,7 @@ func (h *Handler) StartScheduler(ctx context.Context) {
 	// lokasinya sudah dikonfirmasi Bu Nova tetapi finalisasinya tertahan (mis. terputus).
 	go h.reconcileUnfinalizedOfflineMeetings(context.Background())
 
+	middleware.WorkerHeartbeat("scheduler") // emit awal agar seri muncul segera
 	t := time.NewTicker(schedulerPoll)
 	go func() {
 		defer t.Stop()
@@ -52,6 +54,7 @@ func (h *Handler) StartScheduler(ctx context.Context) {
 				return
 			case <-t.C:
 				h.runDueTasks(context.Background())
+				middleware.WorkerHeartbeat("scheduler") // Fase M5: bukti loop hidup
 			}
 		}
 	}()
@@ -228,14 +231,14 @@ func buildReminderInstruction(task model.ScheduledTask) string {
 	return b.String()
 }
 
-// pushToOrchestrator adalah primitive PUSH PROAKTIF ke Pak Sudianto: ia menyuntik
-// satu giliran sistem ke percakapan orchestrator, merakit konteks (acuan tanggal +
-// snapshot meeting + memori), MENYUSUN balasan orchestrator, MENAHANNYA sampai
-// releaseAt, lalu MENGIRIM langsung ke chat SU dan menyimpannya ke memori percakapan.
-// Penyusunan (lambat) terjadi lebih awal, pengiriman tepat pada releaseAt — sehingga
-// pengingat tak telat. Bila releaseAt nol/lewat, kirim begitu siap. Tidak menerapkan
-// actions (turn ini murni memberi tahu — bebas efek samping). Dipakai worker
-// pengingat; bisa dipakai ulang untuk notifikasi proaktif lain.
+// pushToOrchestrator: primitive PUSH PROAKTIF ke Pak Sudianto
+// - Inject giliran sistem ke percakapan orchestrator
+// - Rakit konteks: tanggal + meeting snapshot + memori
+// - Susun balasan orchestrator dan tahan sampai releaseAt
+// - Kirim ke chat SU dan simpan ke memori percakapan
+// - Penyusunan lebih awal, pengiriman tepat pada releaseAt
+// - Tanpa actions (murni notifikasi, bebas efek samping)
+// - Reusable untuk notifikasi proaktif lain
 func (h *Handler) pushToOrchestrator(ctx context.Context, task string, releaseAt time.Time) error {
 	if strings.TrimSpace(h.SUPhone) == "" {
 		return errors.New("SU phone kosong")

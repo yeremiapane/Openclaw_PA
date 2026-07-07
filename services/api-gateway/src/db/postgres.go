@@ -410,6 +410,31 @@ func (s *Store) EnsureContact(ctx context.Context, phone, name, company, email s
 	return c, nil
 }
 
+// AutoWhitelistExternal mendaftarkan nomor tak dikenal sebagai kontak 'external'
+// saat WHITELIST_MODE=open (semua penelepon dilayani pa_communicator). Idempotent
+// & aman terhadap balapan (mirip EnsureContact): bila kontak sudah ada, dikembalikan
+// apa adanya tanpa menimpa trust/profil. `lid` opsional (diisi bila datang via @lid).
+func (s *Store) AutoWhitelistExternal(ctx context.Context, phone, lid string) (*model.Contact, error) {
+	if c, err := s.FindContact(ctx, model.Identifier{Kind: "phone", Value: phone}); err == nil {
+		return c, nil
+	} else if !errors.Is(err, ErrNotWhitelisted) {
+		return nil, err
+	}
+	c, err := s.AddContact(ctx, ContactInput{
+		Phone: phone, Lid: lid, TrustLevel: "external",
+		Notes: "Auto-whitelist (WHITELIST_MODE=open): penelepon publik dilayani pa_communicator",
+	})
+	if err != nil {
+		// Balapan: dua pesan paralel dari nomor sama bisa sama-sama lolos FindContact
+		// lalu bertabrakan di uq_contacts_phone. Ambil ulang yang sudah keburu dibuat.
+		if existing, ferr := s.FindContact(ctx, model.Identifier{Kind: "phone", Value: phone}); ferr == nil {
+			return existing, nil
+		}
+		return nil, err
+	}
+	return c, nil
+}
+
 // FindContactByName mencari kontak aktif berdasarkan nama (case-insensitive).
 // Opsional filter by company. Digunakan untuk rekonsiliasi nomor pada SPAWN_AGENT.
 func (s *Store) FindContactByName(ctx context.Context, name, company string) (*model.Contact, error) {

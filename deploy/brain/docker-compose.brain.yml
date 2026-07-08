@@ -1,0 +1,41 @@
+# Overlay Compose — tambah service "brain" ke stack utama.
+# Jalankan bersama docker-compose.yml root dari root repo:
+#
+#   docker compose -f docker-compose.yml -f deploy/brain/docker-compose.brain.yml up -d --build
+services:
+  brain:
+    build:
+      context: .
+      dockerfile: deploy/brain/Dockerfile
+    image: pa-ai/brain:local
+    container_name: pa_ai_brain
+    env_file:
+      - .env
+    environment:
+      GATEWAY_PORT: "4000"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: pa_ai
+      DB_NAME: pa_ai
+      REDIS_ADDR: redis:6379
+      WAHA_URL: http://waha:3000
+      OPENCLAW_BIN: openclaw
+      OPENCLAW_AGENT: pa_communicator
+    volumes:
+      - ${OPENCLAW_STATE_DIR:-./data/openclaw}:/home/claw/.openclaw
+    ports:
+      - "4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4000/metrics >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 45s

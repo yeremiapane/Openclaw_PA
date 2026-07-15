@@ -17,8 +17,12 @@ if (-not (Test-Path $src)) {
   Write-Error "Tidak menemukan $src"
 }
 
+# Lewati runtime & berkas volatil. Runtime Linux (bin/ = shim openclaw, tools/ =
+# Node.js bundled) datang dari IMAGE lewat skeleton, bukan dari dump ini. Isi tools/
+# di Windows adalah binary Windows: tak berguna di server & memperbesar arsip.
 $exclude = @(
   "--exclude=.openclaw/bin",
+  "--exclude=.openclaw/tools",
   "--exclude=.openclaw/node_modules",
   "--exclude=.openclaw/logs",
   "--exclude=.openclaw/tui",

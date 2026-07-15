@@ -14,12 +14,26 @@ if [ ! -f "$OC_HOME/openclaw.json" ]; then
 else
   echo "[entrypoint] state OpenClaw persisten terdeteksi — dipakai apa adanya"
 fi
-for d in bin node_modules; do
+# Segarkan hanya dir RUNTIME (bukan state) dari skeleton. Idempoten.
+#   bin/         = shim `openclaw`
+#   tools/       = runtime Node.js bundled; bin/openclaw meng-exec tools/node/bin/node.
+#                  WAJIB disalin — dump dari Windows tak memuatnya, dan tanpa ini
+#                  OpenClaw mati: "tools/node/bin/node: No such file or directory".
+#   node_modules = tak selalu ada di skeleton; disalin bila memang ada.
+for d in bin tools node_modules; do
   if [ -d "$OC_SKEL/$d" ]; then
     mkdir -p "$OC_HOME/$d"
     cp -a "$OC_SKEL/$d/." "$OC_HOME/$d/" 2>/dev/null || true
   fi
 done
+
+# Jaring pengaman: gagal cepat dgn pesan jelas bila runtime tetap tak lengkap,
+# ketimbang error membingungkan saat `openclaw gateway`.
+if ! openclaw --version >/dev/null 2>&1; then
+  echo "[entrypoint] FATAL: 'openclaw' tak bisa dijalankan — runtime (bin/tools) tak lengkap di $OC_HOME" >&2
+  echo "[entrypoint]        isi: $(ls "$OC_HOME" 2>/dev/null | tr '\n' ' ')" >&2
+  exit 1
+fi
 
 # ── 2) Nyalakan OpenClaw gateway (latar) ──────────────────────────────────────
 echo "[entrypoint] menyalakan openclaw gateway di ${OC_GW_HOST}:${OC_GW_PORT}"

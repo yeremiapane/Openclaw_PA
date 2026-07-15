@@ -60,45 +60,12 @@ services:
     restart: unless-stopped
 
   # ─── Integration Services (Fase 9) ────────────────────────────────
-  calendar-service:
-    build: ./services/calendar
-    container_name: pa_ai_calendar
-    ports:
-      - "4010:4010"
-    environment:
-      CALENDAR_PORT: "4010"
-      MS_GRAPH_TENANT_ID: ${MS_GRAPH_TENANT_ID}
-      MS_GRAPH_CLIENT_ID: ${MS_GRAPH_CLIENT_ID}
-      MS_GRAPH_CLIENT_SECRET: ${MS_GRAPH_CLIENT_SECRET}
-      MS_GRAPH_USER_UPN: ${MS_GRAPH_USER_UPN}
-    restart: unless-stopped
-
-  teams-service:
-    build: ./services/teams
-    container_name: pa_ai_teams
-    ports:
-      - "4030:4030"
-    environment:
-      TEAMS_PORT: "4030"
-      MS_GRAPH_TENANT_ID: ${MS_GRAPH_TENANT_ID}
-      MS_GRAPH_CLIENT_ID: ${MS_GRAPH_CLIENT_ID}
-      MS_GRAPH_CLIENT_SECRET: ${MS_GRAPH_CLIENT_SECRET}
-      MS_GRAPH_USER_UPN: ${MS_GRAPH_USER_UPN}
-    restart: unless-stopped
-
-  email-service:
-    build: ./services/email
-    container_name: pa_ai_email
-    ports:
-      - "4020:4020"
-    environment:
-      EMAIL_PORT: "4020"
-      MS_GRAPH_TENANT_ID: ${MS_GRAPH_TENANT_ID}
-      MS_GRAPH_CLIENT_ID: ${MS_GRAPH_CLIENT_ID}
-      MS_GRAPH_CLIENT_SECRET: ${MS_GRAPH_CLIENT_SECRET}
-      MS_GRAPH_USER_UPN: ${MS_GRAPH_USER_UPN}
-      FROM_NAME: "PA Asisten"
-    restart: unless-stopped
+  # DIHAPUS. Calendar & Email kini berjalan IN-PROCESS di dalam api-gateway lewat
+  # MS Graph (package services/), dan teams-service sudah ditiadakan. Deklarasi
+  # calendar-service/teams-service/email-service dulu menunjuk ./services/{calendar,
+  # teams,email} yang tak pernah ada di repo → `docker compose up --build` gagal
+  # dengan "unable to prepare context: path ... not found". Kredensial MS_GRAPH_*
+  # dibaca langsung oleh gateway dari .env.
 
   # ─── Monitoring (Fase M1) ──────────────────────────────────
   # Gateway berjalan NATIVE di host (port 4000); Prometheus men-scrape-nya lewat

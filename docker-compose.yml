@@ -79,7 +79,12 @@ services:
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
-      - ./data/prometheus:/prometheus
+      # Alamat target yang bergantung mode deploy. Overlay brain menimpa mount ini
+      # dengan deploy/brain/targets (lihat komentar di prometheus.yml).
+      - ./monitoring/prometheus/targets:/etc/prometheus/targets:ro
+      # Named volume, BUKAN ./data/prometheus — lihat catatan di bagian `volumes:`
+      # paling bawah berkas ini.
+      - prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
@@ -101,7 +106,7 @@ services:
     volumes:
       - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
       - ./monitoring/alertmanager/webhook_token:/etc/alertmanager/webhook_token:ro
-      - ./data/alertmanager:/alertmanager
+      - alertmanager_data:/alertmanager
     command:
       - "--config.file=/etc/alertmanager/alertmanager.yml"
       - "--storage.path=/alertmanager"
@@ -126,7 +131,7 @@ services:
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
-      - ./data/grafana:/var/lib/grafana
+      - grafana_data:/var/lib/grafana
     depends_on:
       - prometheus
       - postgres
@@ -167,3 +172,29 @@ services:
       - /sys:/sys:ro
       - /var/lib/docker/:/var/lib/docker:ro
     restart: unless-stopped
+
+# ─── Volume data monitoring ──────────────────────────────────
+# Ketiganya dulu bind mount ke ./data/*, dan itu MEMATIKAN stack di server Linux:
+# Docker membuat direktori bind mount sebagai root, sedangkan ketiga image ini
+# berjalan sebagai non-root (prometheus & alertmanager uid 65534, grafana uid 472)
+# dan — tak seperti image postgres/redis — TIDAK punya langkah entrypoint-root yang
+# meng-chown direktori datanya. Akibatnya:
+#   prometheus  → panic "Unable to create mmap-ed active query log", crash-loop
+#   grafana     → "GF_PATHS_DATA is not writable", crash-loop
+#   alertmanager→ tetap "Up" tapi diam-diam gagal menyimpan silence/nflog (paling
+#                 berbahaya: kelihatan sehat)
+# Di dev Windows bug ini tak pernah muncul karena Docker Desktop mengabaikan
+# kepemilikan file — jadi ia hanya menampakkan diri saat deploy produksi.
+# Named volume dibuat Docker dgn kepemilikan yang DIWARISI dari image, sehingga
+# benar di semua platform tanpa perlu `chown` manual yang pasti terlupakan.
+#
+# Postgres & Redis sengaja TETAP bind mount ke ./data: image-nya meng-chown sendiri
+# (jadi aman), dan data Postgres bersifat kritis sehingga akses langsung dari host
+# untuk backup jauh lebih berharga.
+#
+# Data monitoring bersifat sekali-pakai. Untuk mengosongkan: `docker compose down`
+# lalu `docker volume rm openclaw_pa_prometheus_data` (dst).
+volumes:
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:

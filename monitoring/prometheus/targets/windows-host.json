@@ -1,0 +1,6 @@
+[
+  {
+    "targets": ["host.docker.internal:9182"],
+    "labels": { "service": "windows-host" }
+  }
+]

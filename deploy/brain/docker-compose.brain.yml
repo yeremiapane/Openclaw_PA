@@ -17,6 +17,19 @@ services:
     environment:
       WHATSAPP_HOOK_URL: http://brain:4000/webhook/waha
 
+  # Alamat scrape yang bergantung mode deploy — alasannya sama persis dgn webhook
+  # di atas: `host.docker.internal` dari root compose menunjuk gateway NATIVE di
+  # host dev Windows. Pada mode brain gateway ada di container, dan di Linux
+  # host.docker.internal (172.17.0.1) paketnya dibuang firewall host → target
+  # api-gateway "context deadline exceeded" selamanya. Isi targets/:
+  #   api-gateway.json  → brain:4000 (lewat jaringan compose, tanpa mampir host)
+  #   windows-host.json → [] (windows_exporter tak ada di Linux; target merah
+  #                       abadi hanya melatih orang mengabaikan warna merah)
+  # Mount ini menimpa ./monitoring/prometheus/targets krn target path-nya sama.
+  prometheus:
+    volumes:
+      - ./deploy/brain/targets:/etc/prometheus/targets:ro
+
   brain:
     build:
       context: .

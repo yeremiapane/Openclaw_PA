@@ -35,6 +35,12 @@ if ! openclaw --version >/dev/null 2>&1; then
   exit 1
 fi
 
+# Image sengaja menarik versi TERBARU saat build (lihat Dockerfile), jadi rebuild
+# bisa mengganti otak bot tanpa ada satu baris kode pun yang berubah. Baris ini
+# membuat pergeseran itu terlihat di log — tanpanya, regresi akibat upgrade tak
+# bisa dibedakan dari regresi akibat perubahan kita sendiri.
+echo "[entrypoint] versi runtime: openclaw=$(openclaw --version 2>&1 | head -1) claude=$(claude --version 2>&1 | head -1)"
+
 # ── 1b) State Claude Code (~/.claude) ─────────────────────────────────────────
 # OpenClaw memakai provider=claude-cli: tiap turn men-spawn binary `claude`. Sesi
 # OAuth-nya tersimpan di ~/.claude, yang datang dari bind mount — dan Docker membuat

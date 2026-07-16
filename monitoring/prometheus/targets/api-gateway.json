@@ -1,0 +1,6 @@
+[
+  {
+    "targets": ["host.docker.internal:4000"],
+    "labels": { "service": "api-gateway" }
+  }
+]

@@ -1,6 +1,8 @@
 # Prometheus — konfigurasi scrape (Fase M1 + M2 monitoring).
-# Gateway berjalan NATIVE di host Windows (bukan container), jadi diakses lewat
-# host.docker.internal. Postgres/Redis/container di-scrape lewat exporter (M2).
+# Berkas ini dipakai SEMUA mode deploy. Yang berbeda antar-mode hanyalah ALAMAT
+# target host (api-gateway & windows-host); itu di-inject lewat targets/*.json,
+# bukan dengan menyalin berkas ini. Postgres/Redis/container di-scrape lewat
+# exporter (M2).
 # Exporter tak perlu port host: Prometheus menjangkaunya via nama service di
 # jaringan compose. windows_exporter WAJIB dipasang native di host Windows
 # (bukan container) dan mendengarkan di :9182 — lihat monitoring/README.md.
@@ -24,13 +26,16 @@ scrape_configs:
     static_configs:
       - targets: ["localhost:9090"]
 
-  # API Gateway PA AI (proses native di host, port 4000).
+  # API Gateway PA AI. ALAMATNYA BERBEDA per-mode deploy, jadi daftar targetnya
+  # dipisah ke berkas agar overlay bisa menimpa alamat saja tanpa menyalin seluruh
+  # config ini (salinan penuh pasti melenceng begitu ada job baru):
+  #   dev   → monitoring/prometheus/targets/  (gateway native di host Windows)
+  #   brain → deploy/brain/targets/           (gateway di dalam container)
+  # Prometheus memuat ulang berkas ini sendiri; tak perlu restart.
   - job_name: api-gateway
     metrics_path: /metrics
-    static_configs:
-      - targets: ["host.docker.internal:4000"]
-        labels:
-          service: api-gateway
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/api-gateway.json"]
 
   # ─── Fase M2 — Infrastruktur ─────────────────────────────────
   # Postgres (data KRITIS): koneksi, commit/rollback, ukuran DB, dsb.
@@ -57,8 +62,9 @@ scrape_configs:
   # windows_exporter: CPU/RAM/disk FISIK host Windows. Dipasang native di host
   # (service Windows), BUKAN container. Jika belum terpasang, target ini "down"
   # tanpa mengganggu yang lain.
+  # Di server LINUX exporter ini tak ada sama sekali, jadi overlay brain menimpanya
+  # dengan daftar KOSONG — target yang merah selamanya melatih orang mengabaikan
+  # warna merah, dan itu jauh lebih berbahaya daripada tak punya metrik host.
   - job_name: windows-host
-    static_configs:
-      - targets: ["host.docker.internal:9182"]
-        labels:
-          service: windows-host
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/windows-host.json"]

@@ -1,0 +1,6 @@
+[
+  {
+    "targets": ["brain:4000"],
+    "labels": { "service": "api-gateway" }
+  }
+]

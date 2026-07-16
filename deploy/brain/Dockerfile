@@ -36,6 +36,17 @@ RUN sudo mkdir -p /opt/openclaw-skel \
     && sudo cp -a /home/claw/.openclaw/. /opt/openclaw-skel/ \
     && sudo chown -R claw:claw /opt/openclaw-skel
 
+# Claude Code CLI — WAJIB. OpenClaw dikonfigurasi dengan provider=claude-cli, artinya
+# ia menjalankan binary `claude` sebagai subprocess dan menulis prompt ke stdin-nya.
+# Tanpa binary ini setiap turn mati dalam ~3ms dengan "FailoverError: write EPIPE"
+# (OpenClaw menulis ke pipa yang ujungnya tak pernah ada) — pesan gagal TANPA
+# menyebut `claude` sama sekali, jadi sangat menyesatkan. Di dev Windows ini lolos
+# karena Claude Code memang terpasang di mesin; di container harus dipasang eksplisit.
+# Terpasang ke /home/claw/.local/bin (sudah ada di PATH, lihat ENV PATH di atas).
+ARG CLAUDE_CODE_VERSION=""
+RUN curl -fsSL https://claude.ai/install.sh | bash -s -- ${CLAUDE_CODE_VERSION:+"$CLAUDE_CODE_VERSION"} \
+    && claude --version
+
 WORKDIR /app/gateway
 COPY --chown=claw:claw --from=gobuild /out/api-gateway ./api-gateway
 COPY --chown=claw:claw services/api-gateway/assets ./assets

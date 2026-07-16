@@ -37,6 +37,11 @@ services:
       OPENCLAW_AGENT: pa_communicator
     volumes:
       - ${OPENCLAW_STATE_DIR:-./data/openclaw}:/home/claw/.openclaw
+      # Kredensial OAuth Claude Code. Binary `claude` ikut image, tetapi sesi login-nya
+      # tersimpan di ~/.claude — TANPA volume ini, auth hilang setiap container dibuat
+      # ulang (dan `up -d` membuat ulang container), sehingga bot mati diam-diam pada
+      # deploy berikutnya. Login cukup SEKALI: lihat deploy/brain/README.md.
+      - ${CLAUDE_STATE_DIR:-./data/claude}:/home/claw/.claude
     ports:
       - "4000:4000"
     depends_on:

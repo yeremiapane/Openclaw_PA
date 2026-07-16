@@ -35,6 +35,26 @@ if ! openclaw --version >/dev/null 2>&1; then
   exit 1
 fi
 
+# ── 1b) State Claude Code (~/.claude) ─────────────────────────────────────────
+# OpenClaw memakai provider=claude-cli: tiap turn men-spawn binary `claude`. Sesi
+# OAuth-nya tersimpan di ~/.claude, yang datang dari bind mount — dan Docker membuat
+# bind mount sebagai root, sedangkan proses ini berjalan sebagai claw (uid 1000).
+# Tanpa perbaikan kepemilikan, `claude` tak bisa menulis sesi login ke situ.
+CLAUDE_HOME="${CLAUDE_HOME:-/home/claw/.claude}"
+sudo mkdir -p "$CLAUDE_HOME"
+if [ ! -w "$CLAUDE_HOME" ]; then
+  sudo chown -R claw:claw "$CLAUDE_HOME" || true
+fi
+
+# Diagnostik: turn agent akan gagal dgn "FailoverError: write EPIPE" bila `claude`
+# belum login — pesan itu tak menyebut `claude` sama sekali & sangat menyesatkan.
+# Bukan fatal: gateway & api-gateway tetap perlu hidup agar bisa login dari dalam.
+if [ -z "$(ls -A "$CLAUDE_HOME" 2>/dev/null || true)" ]; then
+  echo "[entrypoint] PERINGATAN: $CLAUDE_HOME kosong — Claude Code belum login."
+  echo "[entrypoint]   Setiap turn agent akan gagal: 'FailoverError: write EPIPE'."
+  echo "[entrypoint]   Login SEKALI:  docker exec -it pa_ai_brain claude  (ikuti alur OAuth)"
+fi
+
 # ── 2) Nyalakan OpenClaw gateway (latar) ──────────────────────────────────────
 echo "[entrypoint] menyalakan openclaw gateway di ${OC_GW_HOST}:${OC_GW_PORT}"
 HOST="$OC_GW_HOST" openclaw gateway &

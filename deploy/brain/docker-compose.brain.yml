@@ -3,6 +3,20 @@
 #
 #   docker compose -f docker-compose.yml -f deploy/brain/docker-compose.brain.yml up -d --build
 services:
+  # Arahkan webhook WAHA langsung ke container brain, menimpa nilai
+  # host.docker.internal:4000 dari docker-compose.yml root.
+  #
+  # Root compose mengasumsikan gateway berjalan NATIVE di host (dev Windows), jadi
+  # WAHA harus memutar keluar lewat host.docker.internal. Pada mode brain (Opsi A)
+  # gateway ada di dalam container pada jaringan compose yang sama, sehingga
+  # host.docker.internal justru merugikan: di Linux ia menunjuk 172.17.0.1 (bridge
+  # docker0) dan paket dibuang firewall host → WAHA gagal kirim webhook dengan
+  # "connect ETIMEDOUT 172.17.0.1:4000" dan pesan masuk tak pernah sampai.
+  # Memanggil `brain:4000` langsung menghapus lompatan ke host itu sepenuhnya.
+  waha:
+    environment:
+      WHATSAPP_HOOK_URL: http://brain:4000/webhook/waha
+
   brain:
     build:
       context: .

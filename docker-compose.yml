@@ -36,8 +36,7 @@ services:
 
   # ─── Transport ─────────────────────────────────────────────
   waha:
-    # Engine GOWS (Go/whatsmeow, browser-free) — ringan seperti NOWEB tetapi
-    # MENDUKUNG kirim file/lampiran di tier Core (NOWEB mengunci sendFile ke Plus).
+    # Engine GOWS (Go/whatsmeow, browser-free)
     image: devlikeapro/waha:gows
     container_name: pa_ai_waha
     ports:
@@ -59,18 +58,8 @@ services:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
-  # ─── Integration Services (Fase 9) ────────────────────────────────
-  # DIHAPUS. Calendar & Email kini berjalan IN-PROCESS di dalam api-gateway lewat
-  # MS Graph (package services/), dan teams-service sudah ditiadakan. Deklarasi
-  # calendar-service/teams-service/email-service dulu menunjuk ./services/{calendar,
-  # teams,email} yang tak pernah ada di repo → `docker compose up --build` gagal
-  # dengan "unable to prepare context: path ... not found". Kredensial MS_GRAPH_*
-  # dibaca langsung oleh gateway dari .env.
-
   # ─── Monitoring (Fase M1) ──────────────────────────────────
-  # Gateway berjalan NATIVE di host (port 4000); Prometheus men-scrape-nya lewat
-  # host.docker.internal. Port host memakai rentang 1xxxx agar tak bentrok dengan
-  # rentang reserved WinNAT (alasan sama seperti WAHA di :13000).
+  # Gateway berjalan NATIVE di host (port 4000)
   prometheus:
     image: prom/prometheus:v2.54.1
     container_name: pa_ai_prometheus
@@ -79,11 +68,7 @@ services:
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
-      # Alamat target yang bergantung mode deploy. Overlay brain menimpa mount ini
-      # dengan deploy/brain/targets (lihat komentar di prometheus.yml).
       - ./monitoring/prometheus/targets:/etc/prometheus/targets:ro
-      # Named volume, BUKAN ./data/prometheus — lihat catatan di bagian `volumes:`
-      # paling bawah berkas ini.
       - prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -96,8 +81,7 @@ services:
     restart: unless-stopped
 
   # Alertmanager (Fase M3b): terima alert dari Prometheus, kirim email lewat
-  # webhook gateway (/internal/alerts). Token Bearer dibaca dari file webhook_token
-  # (ter-gitignore) — isinya = ALERT_WEBHOOK_TOKEN. Lihat monitoring/README.md.
+  # webhook gateway (/internal/alerts).
   alertmanager:
     image: prom/alertmanager:v0.27.0
     container_name: pa_ai_alertmanager
@@ -137,11 +121,7 @@ services:
       - postgres
     restart: unless-stopped
 
-  # ─── Monitoring exporters (Fase M2 — Infrastruktur) ────────
-  # Exporter TIDAK meng-expose port ke host: Prometheus menjangkaunya lewat
-  # nama service di jaringan compose (lebih kecil permukaan serangannya).
-  # CPU/RAM FISIK host Windows dipantau windows_exporter yang dipasang NATIVE
-  # di host (bukan di sini) — lihat monitoring/README.md.
+  # ─── Monitoring exporters ────────
   postgres-exporter:
     image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
     container_name: pa_ai_postgres_exporter
@@ -174,26 +154,6 @@ services:
     restart: unless-stopped
 
 # ─── Volume data monitoring ──────────────────────────────────
-# Ketiganya dulu bind mount ke ./data/*, dan itu MEMATIKAN stack di server Linux:
-# Docker membuat direktori bind mount sebagai root, sedangkan ketiga image ini
-# berjalan sebagai non-root (prometheus & alertmanager uid 65534, grafana uid 472)
-# dan — tak seperti image postgres/redis — TIDAK punya langkah entrypoint-root yang
-# meng-chown direktori datanya. Akibatnya:
-#   prometheus  → panic "Unable to create mmap-ed active query log", crash-loop
-#   grafana     → "GF_PATHS_DATA is not writable", crash-loop
-#   alertmanager→ tetap "Up" tapi diam-diam gagal menyimpan silence/nflog (paling
-#                 berbahaya: kelihatan sehat)
-# Di dev Windows bug ini tak pernah muncul karena Docker Desktop mengabaikan
-# kepemilikan file — jadi ia hanya menampakkan diri saat deploy produksi.
-# Named volume dibuat Docker dgn kepemilikan yang DIWARISI dari image, sehingga
-# benar di semua platform tanpa perlu `chown` manual yang pasti terlupakan.
-#
-# Postgres & Redis sengaja TETAP bind mount ke ./data: image-nya meng-chown sendiri
-# (jadi aman), dan data Postgres bersifat kritis sehingga akses langsung dari host
-# untuk backup jauh lebih berharga.
-#
-# Data monitoring bersifat sekali-pakai. Untuk mengosongkan: `docker compose down`
-# lalu `docker volume rm openclaw_pa_prometheus_data` (dst).
 volumes:
   prometheus_data:
   alertmanager_data:

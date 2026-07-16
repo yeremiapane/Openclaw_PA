@@ -1,31 +1,9 @@
-# Overlay Compose — tambah service "brain" ke stack utama.
-# Jalankan bersama docker-compose.yml root dari root repo:
-#
 #   docker compose -f docker-compose.yml -f deploy/brain/docker-compose.brain.yml up -d --build
 services:
-  # Arahkan webhook WAHA langsung ke container brain, menimpa nilai
-  # host.docker.internal:4000 dari docker-compose.yml root.
-  #
-  # Root compose mengasumsikan gateway berjalan NATIVE di host (dev Windows), jadi
-  # WAHA harus memutar keluar lewat host.docker.internal. Pada mode brain (Opsi A)
-  # gateway ada di dalam container pada jaringan compose yang sama, sehingga
-  # host.docker.internal justru merugikan: di Linux ia menunjuk 172.17.0.1 (bridge
-  # docker0) dan paket dibuang firewall host → WAHA gagal kirim webhook dengan
-  # "connect ETIMEDOUT 172.17.0.1:4000" dan pesan masuk tak pernah sampai.
-  # Memanggil `brain:4000` langsung menghapus lompatan ke host itu sepenuhnya.
   waha:
     environment:
       WHATSAPP_HOOK_URL: http://brain:4000/webhook/waha
 
-  # Alamat scrape yang bergantung mode deploy — alasannya sama persis dgn webhook
-  # di atas: `host.docker.internal` dari root compose menunjuk gateway NATIVE di
-  # host dev Windows. Pada mode brain gateway ada di container, dan di Linux
-  # host.docker.internal (172.17.0.1) paketnya dibuang firewall host → target
-  # api-gateway "context deadline exceeded" selamanya. Isi targets/:
-  #   api-gateway.json  → brain:4000 (lewat jaringan compose, tanpa mampir host)
-  #   windows-host.json → [] (windows_exporter tak ada di Linux; target merah
-  #                       abadi hanya melatih orang mengabaikan warna merah)
-  # Mount ini menimpa ./monitoring/prometheus/targets krn target path-nya sama.
   prometheus:
     volumes:
       - ./deploy/brain/targets:/etc/prometheus/targets:ro
@@ -50,10 +28,6 @@ services:
       OPENCLAW_AGENT: pa_communicator
     volumes:
       - ${OPENCLAW_STATE_DIR:-./data/openclaw}:/home/claw/.openclaw
-      # Kredensial OAuth Claude Code. Binary `claude` ikut image, tetapi sesi login-nya
-      # tersimpan di ~/.claude — TANPA volume ini, auth hilang setiap container dibuat
-      # ulang (dan `up -d` membuat ulang container), sehingga bot mati diam-diam pada
-      # deploy berikutnya. Login cukup SEKALI: lihat deploy/brain/README.md.
       - ${CLAUDE_STATE_DIR:-./data/claude}:/home/claw/.claude
     ports:
       - "4000:4000"

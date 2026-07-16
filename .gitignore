@@ -1,6 +1,5 @@
 # ─── Rahasia ────────────────────────────────────────────────
-# .env berisi kredensial asli — JANGAN pernah di-commit.
-# .env.example (template, semua nilai kosong) SENGAJA di-track sbg dokumentasi
+# .env berisi kredensial asli
 # var yang dibutuhkan — lihat services/api-gateway/src/config/config.go.
 .env
 .env.*
@@ -16,7 +15,7 @@
 # /data/  = volume container: data/postgres (DB) & data/openclaw (state brain).
 # /.waha/ = session WhatsApp.
 # /.openclaw/ = state OpenClaw lokal / hasil ekstrak dump migrasi. Memuat RAHASIA
-#   (openclaw.json → gateway.auth.token) — diabaikan SELURUHNYA, bukan cache/log saja.
+#   (openclaw.json → gateway.auth.token)
 /data/
 /.waha/
 /.waha.noweb.bak
@@ -27,8 +26,6 @@ openclaw-dump.tar.gz
 waha_qr.png
 
 # ─── Go ─────────────────────────────────────────────────────
-# CATATAN: go.mod & go.sum WAJIB ter-track — deploy/brain/Dockerfile menyalinnya
-# saat build. Jangan pernah menambahkannya ke daftar ini.
 *.exe
 *.test
 *.out
@@ -44,3 +41,6 @@ Thumbs.db
 
 # ─── Log ────────────────────────────────────────────────────
 log.txt
+
+*.png
+*.ps1

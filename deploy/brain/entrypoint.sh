@@ -14,12 +14,6 @@ if [ ! -f "$OC_HOME/openclaw.json" ]; then
 else
   echo "[entrypoint] state OpenClaw persisten terdeteksi — dipakai apa adanya"
 fi
-# Segarkan hanya dir RUNTIME (bukan state) dari skeleton. Idempoten.
-#   bin/         = shim `openclaw`
-#   tools/       = runtime Node.js bundled; bin/openclaw meng-exec tools/node/bin/node.
-#                  WAJIB disalin — dump dari Windows tak memuatnya, dan tanpa ini
-#                  OpenClaw mati: "tools/node/bin/node: No such file or directory".
-#   node_modules = tak selalu ada di skeleton; disalin bila memang ada.
 for d in bin tools node_modules; do
   if [ -d "$OC_SKEL/$d" ]; then
     mkdir -p "$OC_HOME/$d"
@@ -27,34 +21,20 @@ for d in bin tools node_modules; do
   fi
 done
 
-# Jaring pengaman: gagal cepat dgn pesan jelas bila runtime tetap tak lengkap,
-# ketimbang error membingungkan saat `openclaw gateway`.
 if ! openclaw --version >/dev/null 2>&1; then
   echo "[entrypoint] FATAL: 'openclaw' tak bisa dijalankan — runtime (bin/tools) tak lengkap di $OC_HOME" >&2
   echo "[entrypoint]        isi: $(ls "$OC_HOME" 2>/dev/null | tr '\n' ' ')" >&2
   exit 1
 fi
 
-# Image sengaja menarik versi TERBARU saat build (lihat Dockerfile), jadi rebuild
-# bisa mengganti otak bot tanpa ada satu baris kode pun yang berubah. Baris ini
-# membuat pergeseran itu terlihat di log — tanpanya, regresi akibat upgrade tak
-# bisa dibedakan dari regresi akibat perubahan kita sendiri.
 echo "[entrypoint] versi runtime: openclaw=$(openclaw --version 2>&1 | head -1) claude=$(claude --version 2>&1 | head -1)"
 
-# ── 1b) State Claude Code (~/.claude) ─────────────────────────────────────────
-# OpenClaw memakai provider=claude-cli: tiap turn men-spawn binary `claude`. Sesi
-# OAuth-nya tersimpan di ~/.claude, yang datang dari bind mount — dan Docker membuat
-# bind mount sebagai root, sedangkan proses ini berjalan sebagai claw (uid 1000).
-# Tanpa perbaikan kepemilikan, `claude` tak bisa menulis sesi login ke situ.
 CLAUDE_HOME="${CLAUDE_HOME:-/home/claw/.claude}"
 sudo mkdir -p "$CLAUDE_HOME"
 if [ ! -w "$CLAUDE_HOME" ]; then
   sudo chown -R claw:claw "$CLAUDE_HOME" || true
 fi
 
-# Diagnostik: turn agent akan gagal dgn "FailoverError: write EPIPE" bila `claude`
-# belum login — pesan itu tak menyebut `claude` sama sekali & sangat menyesatkan.
-# Bukan fatal: gateway & api-gateway tetap perlu hidup agar bisa login dari dalam.
 if [ -z "$(ls -A "$CLAUDE_HOME" 2>/dev/null || true)" ]; then
   echo "[entrypoint] PERINGATAN: $CLAUDE_HOME kosong — Claude Code belum login."
   echo "[entrypoint]   Setiap turn agent akan gagal: 'FailoverError: write EPIPE'."

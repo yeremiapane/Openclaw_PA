@@ -108,9 +108,7 @@ func (e *WahaEvent) Contacts() []VCardContact {
 	return out
 }
 
-// ContactText merangkai kartu kontak terlampir menjadi teks yang dimengerti agent
-// (dan disimpan ke memori percakapan), agar nomor dapat dikorelasikan dengan maksud
-// meeting walau dikirim di giliran terpisah. Kosong bila tak ada kontak terbaca.
+// ContactText merangkai kartu kontak terlampir menjadi teks yang bisa dibaca 
 func (e *WahaEvent) ContactText() string {
 	cs := e.Contacts()
 	if len(cs) == 0 {
@@ -171,7 +169,7 @@ func parseVCard(raw string) VCardContact {
 		}
 		c.Name = unescapeVCard(strings.TrimSpace(given + " " + family))
 	}
-	if r := []rune(c.Name); len(r) > 100 { // pertahanan thd kartu jahat (nama panjang)
+	if r := []rune(c.Name); len(r) > 100 { 
 		c.Name = string(r[:100])
 	}
 	return c
@@ -291,7 +289,8 @@ type Message struct {
 // "WATCH_EMAIL" (WatchCriteria + opsional WatchFrom/WatchKeyword/WatchLabel),
 // "CANCEL_WATCH" (WatchID),
 // "READ_EMAILS" (opsional EmailScope=unread|unreplied|all + EmailFrom/EmailKeyword),
-// "SEND_DOCUMENT" (DocFilename+DocContent + opsional DocMime/DocEncoding/DocCaption),
+// "SEND_DOCUMENT" (DocFilename + DocContent ATAU DocPath + opsional DocMime/DocEncoding/DocCaption),
+// "DEFER_TASK" (Task + opsional DeferMinutes/ReminderLabel),
 // "UPDATE_AGENT_PERSONA" (PersonaText + opsional TargetAgent).
 type Action struct {
 	Type     string `json:"type"`
@@ -299,45 +298,36 @@ type Action struct {
 	Agent    string `json:"agent,omitempty"`
 	Target   string `json:"target,omitempty"`
 	Task     string `json:"task,omitempty"`
-	// Profil kontak target untuk SPAWN_AGENT (opsional) — dipakai untuk mendaftarkan
-	// kontak baru agar balasan dikenali dan untuk undangan email.
+	// Profil kontak untuk SPAWN_AGENT (opsional) — digunakan untuk registrasi kontak dan undangan email.
 	TargetName    string `json:"targetName,omitempty"`
 	TargetCompany string `json:"targetCompany,omitempty"`
 	TargetEmail   string `json:"targetEmail,omitempty"`
 	// Usulan detail meeting untuk SPAWN_AGENT (opsional).
 	MeetingTopic    string `json:"meetingTopic,omitempty"`
-	MeetingDatetime string `json:"meetingDatetime,omitempty"` // RFC3339, mis. 2026-06-26T10:00:00+07:00
-	MeetingVenue    string `json:"meetingVenue,omitempty"`    // kosong → online (Teams)
-	// ApprovalID untuk CONFIRM_MEETING: id approval meeting yang sudah ada & menunggu,
-	// yang ingin disetujui via obrolan tanpa membuat approval/meeting baru.
+	MeetingDatetime string `json:"meetingDatetime,omitempty"` // RFC3339, contoh: 2026-06-26T10:00:00+07:00
+	MeetingVenue    string `json:"meetingVenue,omitempty"`    // kosong = online
+	// ApprovalID untuk CONFIRM_MEETING: ID approval meeting yang menunggu persetujuan.
 	ApprovalID int64 `json:"approvalId,omitempty"`
-	// MeetingID merujuk satu meeting di snapshot status (kolom meetingId=N). Dipakai
-	// action RESCHEDULE_MEETING & CANCEL_MEETING (orchestrator/SU) untuk mengubah atau
-	// membatalkan meeting yang SUDAH tercatat/terjadwal.
+	// MeetingID: referensi meeting di snapshot; dipakai untuk RESCHEDULE_MEETING/CANCEL_MEETING.
 	MeetingID int64 `json:"meetingId,omitempty"`
-	// NewDatetime = jadwal MULAI baru (RFC3339 +07:00) untuk RESCHEDULE_MEETING.
+	// NewDatetime: jadwal mulai baru (RFC3339 +07:00) untuk RESCHEDULE_MEETING.
 	NewDatetime string `json:"newDatetime,omitempty"`
-	// Reason = alasan singkat untuk CANCEL_MEETING / RESCHEDULE_MEETING / REQUEST_MEETING_CHANGE.
+	// Reason: alasan singkat untuk cancel/reschedule/request change.
 	Reason string `json:"reason,omitempty"`
-	// ChangeKind = jenis perubahan yang diminta untuk REQUEST_MEETING_CHANGE.
+	// ChangeKind: jenis perubahan untuk REQUEST_MEETING_CHANGE.
 	ChangeKind   string          `json:"changeKind,omitempty"`
 	VenueName    string          `json:"venueName,omitempty"`
 	VenueAddress string          `json:"venueAddress,omitempty"`
 	Payload      json.RawMessage `json:"payload,omitempty"`
-	// SET_REMINDER (orchestrator/SU): ReminderTime = waktu pengingat (RFC3339 +07:00,
-	// contoh: 2026-07-01T15:00:00+07:00). ReminderNote = isi pengingat. Worker menugaskan
-	// orchestrator untuk mengirim saat waktunya.
-	//
-	// Untuk pengingat BERULANG: RecurKind = "daily"|"weekly" (kosong/"none" = sekali).
-	// RecurTime = "HH:MM" WIB (untuk berulang). Jika "weekly", set RecurDow (0=Min..6=Sab).
-	// ReminderTime tetap menentukan kejadian pertama; sistem menjadwalkan berikutnya
-	// otomatis. ReminderLabel = referensi singkat untuk pembatalan.
 	ReminderTime  string `json:"reminderTime,omitempty"`
 	ReminderNote  string `json:"reminderNote,omitempty"`
 	RecurKind     string `json:"recurKind,omitempty"` // none|daily|weekly
 	RecurTime     string `json:"recurTime,omitempty"` // "HH:MM" WIB (berulang)
 	RecurDow      *int   `json:"recurDow,omitempty"`  // 0-6 (weekly)
 	ReminderLabel string `json:"reminderLabel,omitempty"`
+	// DEFER_TASK: tunda pekerjaan berat ke giliran latar belakang.
+	// Task = uraian lengkap. DeferMinutes = jeda sebelum eksekusi (0 = segera).
+	DeferMinutes int `json:"deferMinutes,omitempty"`
 	// CANCEL_REMINDER (orchestrator/SU): ReminderID = id pengingat aktif (lihat snapshot)
 	// yang ingin dibatalkan. Untuk pengingat berulang, membatalkan menghentikan seluruh seri.
 	ReminderID int64 `json:"reminderId,omitempty"`
@@ -352,27 +342,28 @@ type Action struct {
 	WatchKeyword  string `json:"watchKeyword,omitempty"`
 	WatchLabel    string `json:"watchLabel,omitempty"`
 	WatchID       int64  `json:"watchId,omitempty"`
-	// READ_EMAILS (orchestrator/SU): cek inbox SAAT ITU JUGA (on-demand), beda dari
-	// WATCH_EMAIL yang proaktif. Sistem menarik email terbaru, menyaring sesuai scope,
-	// lalu menyuntik hasilnya balik ke orchestrator untuk disusun jadi laporan ke SU.
+	// READ_EMAILS (orchestrator/SU): cek inbox SAAT ITU JUGA (on-demand)
 	//   EmailScope   = "unread" (belum dibaca) | "unreplied" (belum dibalas) | "" / "all" (semua terbaru).
 	//   EmailFrom    = filter pengirim opsional (substring email/nama).
 	//   EmailKeyword = filter kata kunci subjek/isi opsional (dipisah koma = OR).
 	EmailScope   string `json:"emailScope,omitempty"`
 	EmailFrom    string `json:"emailFrom,omitempty"`
 	EmailKeyword string `json:"emailKeyword,omitempty"`
-	// SEND_DOCUMENT (orchestrator/SU): Agent menyediakan isi laporan/dokumen lalu
-	// gateway menulis file dan mengirim. Gateway tidak menyimpan template atau logika.
-	//   DocFilename = nama file dengan ekstensi (contoh: "Laporan Juni.csv").
-	//   DocMime = tipe konten (contoh: "text/csv"); kosong → deteksi dari ekstensi.
-	//   DocEncoding = "utf8" (default) | "base64" (biner).
-	//   DocContent = isi file (teks atau base64 jika encoding=base64).
-	//   DocCaption = keterangan lampiran (opsional).
+	// SEND_DOCUMENT (orchestrator/SU): kirim dokumen/laporan.
+	//   DocFilename = nama file.
+	//   DocMime = tipe konten; kosong → deteksi dari ekstensi.
+	//   DocEncoding = "utf8" (default) | "base64".
+	//   DocContent = isi file.
+	//   DocCaption = caption lampiran (opsional).
+	//   DocPath = path file yang sudah ditulis agent di DOC_WORK_DIR.
+	// Gunakan DocContent untuk teks (CSV/MD/HTML/JSON/TXT), dan DocPath untuk
+	// biner (XLSX/PDF/PPTX/PNG). Jika keduanya ada, DocPath diprioritaskan.
 	DocFilename string `json:"docFilename,omitempty"`
 	DocMime     string `json:"docMime,omitempty"`
 	DocEncoding string `json:"docEncoding,omitempty"`
 	DocContent  string `json:"docContent,omitempty"`
 	DocCaption  string `json:"docCaption,omitempty"`
+	DocPath     string `json:"docPath,omitempty"`
 	// UPDATE_AGENT_PERSONA (orchestrator/SU): Mengubah preferensi gaya ringan agent
 	// (nada, sapaan, formalitas, emoji, panjang jawaban, bahasa, dll.). Agent kirim
 	// PersonaText sebagai overlay penuh (mengganti overlay lama). Gateway menyimpan

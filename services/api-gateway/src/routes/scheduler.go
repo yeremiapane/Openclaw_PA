@@ -82,16 +82,34 @@ func (h *Handler) runDueTasks(ctx context.Context) {
 func (h *Handler) fireTask(ctx context.Context, task model.ScheduledTask) {
 	// Timeout = jendela susun-awal + anggaran penyusunan LLM. Penahanan memakai
 	// sebagian jendela ini (bukan menambah di atas penyusunan), jadi 5 menit lega.
-	fctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	// KERJA BERAT (deep_work) beda urusan: itu memang dimaksudkan berjalan lama.
+	budget := 5 * time.Minute
+	if task.Kind == "deep_work" {
+		budget = deepWorkBudget + 5*time.Minute
+	}
+	fctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
 	// Instruksi default = pengingat statis. Untuk DIGEST KALENDER, tarik agenda hari
 	// ini langsung dari kalender PA lalu minta orchestrator menyusun ringkasan + rencana.
 	instruction := buildReminderInstruction(task)
-	if task.Kind == "calendar_digest" {
+	opts := pushOpts{releaseAt: task.FireAt}
+	switch task.Kind {
+	case "calendar_digest":
 		instruction = h.buildCalendarDigestInstruction(fctx, task)
+	case "deep_work":
+		instruction = buildDeepWorkInstruction(task)
+		// Kirim BEGITU selesai, jangan ditahan sampai fire_at: fire_at di sini
+		// menandai kapan pekerjaan MULAI, bukan kapan laporannya jatuh tempo.
+		opts.releaseAt = time.Now()
+		// Anggaran waktu besar — inilah seluruh alasan DEFER_TASK ada.
+		opts.timeout = deepWorkBudget
+		// Kerja berat sering berujung pada berkas (SEND_DOCUMENT). Tanpa ini,
+		// action-nya dibuang diam-diam dan Pak Sudianto hanya menerima teks yang
+		// menjanjikan lampiran yang tak pernah datang.
+		opts.applyActions = true
 	}
-	err := h.pushToOrchestrator(fctx, instruction, task.FireAt)
+	err := h.pushToOrchestrator(fctx, instruction, opts)
 
 	// Pengingat MEETING juga dikirim ke pihak EKSTERNAL via WhatsApp (bila ada chat
 	// eksternal). SU sudah dapat push di atas; ini melengkapi agar kedua pihak diingatkan.
@@ -218,6 +236,112 @@ func holdUntil(ctx context.Context, releaseAt time.Time) error {
 	}
 }
 
+// deepWorkBudget = batas waktu SATU giliran kerja berat (DEFER_TASK). Jauh di atas
+// OPENCLAW_TIMEOUT_SEC (180 dtk) yang berlaku untuk percakapan biasa: giliran ini
+// berjalan di latar belakang, tak ada yang menunggu di ujung WhatsApp, jadi menelusuri
+// belasan sumber lalu menyusun berkas boleh memakan waktu. Tetap dibatasi agar satu
+// tugas yang macet tidak menahan proses CLI selamanya.
+const deepWorkBudget = 15 * time.Minute
+
+// maxPendingDeepWork = batas tugas berat yang boleh mengantre sekaligus. Giliran kerja
+// berat boleh memanggil DEFER_TASK lagi (memang begitu cara memecah pekerjaan panjang
+// jadi beberapa tahap), dan justru itu bahayanya: agent yang salah menilai "belum selesai"
+// akan menunda dirinya sendiri tanpa henti. Batas ini membuat kegagalan itu berhenti
+// sendiri alih-alih membakar giliran LLM diam-diam sampai ada yang menyadarinya.
+const maxPendingDeepWork = 5
+
+// buildDeepWorkInstruction merangkai giliran lanjutan untuk pekerjaan yang ditunda.
+// Nadanya berbeda dari pengingat: ini bukan "sampaikan sesuatu ke Pak Sudianto",
+// melainkan "kerjakan sekarang, lalu laporkan hasilnya".
+func buildDeepWorkInstruction(task model.ScheduledTask) string {
+	var b strings.Builder
+	b.WriteString("[TUGAS TERTUNDA — giliran sistem, BUKAN pesan dari Pak Sudianto]\n")
+	b.WriteString("Sebelumnya kamu menunda pekerjaan di bawah ini karena butuh waktu. ")
+	b.WriteString("Sekarang KERJAKAN sampai tuntas. Kamu punya waktu jauh lebih lega ")
+	b.WriteString("daripada giliran percakapan biasa, jadi telusuri sumbernya dengan benar.\n\n")
+	b.WriteString("Pekerjaan: " + strings.TrimSpace(task.Note) + "\n\n")
+	b.WriteString("Setelah selesai, isi `response` dengan LAPORAN HASILNYA untuk Pak Sudianto ")
+	b.WriteString("dalam Bahasa Indonesia — langsung ke isinya, jangan menyebut bahwa ini ")
+	b.WriteString("proses otomatis atau giliran sistem. Bila hasilnya lebih enak dibaca sebagai ")
+	b.WriteString("berkas (tabel, laporan, presentasi, grafik), lampirkan lewat SEND_DOCUMENT.\n")
+	b.WriteString("Bila ternyata masih perlu satu tahap lagi, panggil DEFER_TASK sekali lagi ")
+	b.WriteString("dengan sisa pekerjaannya — tetapi laporkan dulu apa yang SUDAH kamu dapat, ")
+	b.WriteString("jangan biarkan Pak Sudianto menunggu tanpa kabar.\n")
+	b.WriteString("Bila pekerjaannya gagal atau datanya tidak ketemu, KATAKAN APA ADANYA. ")
+	b.WriteString("Laporan karangan jauh lebih merugikan daripada laporan kosong.")
+	return b.String()
+}
+
+// minDeferDelay = jeda terpendek yang boleh dipakai tugas berat.
+const minDeferDelay = schedulerPrepLead + time.Minute
+
+// deferDelay menentukan jeda sebelum tugas berat mulai dikerjakan. Batas ATAS 24 jam
+// menjaga agar salah ketik (mis. 10080 = seminggu)
+func deferDelay(minutes int) time.Duration {
+	d := time.Duration(minutes) * time.Minute
+	if d < minDeferDelay {
+		return minDeferDelay
+	}
+	if d > 24*time.Hour {
+		return 24 * time.Hour
+	}
+	return d
+}
+
+// deferTask menjalankan action DEFER_TASK: orchestrator menyerahkan pekerjaan berat
+// (riset, penelusuran, penyusunan laporan) ke giliran latar belakang, lalu membalas
+// Pak Sudianto sekarang juga tanpa menunggu pekerjaan itu selesai.
+func (h *Handler) deferTask(ctx context.Context, initiator *model.Contact, a model.Action) {
+	if initiator == nil || initiator.TrustLevel != "su" {
+		trust := "(nil)"
+		if initiator != nil {
+			trust = initiator.TrustLevel
+		}
+		log.Printf("[DEFER] DITOLAK: inisiator non-SU (trust=%s)", trust)
+		return
+	}
+	brief := firstNonEmptyStr(strings.TrimSpace(a.Task), strings.TrimSpace(a.ReminderNote))
+	if brief == "" {
+		log.Printf("[DEFER] brief kosong — diabaikan")
+		return
+	}
+
+	// Rem anti-penundaan-beruntun (lihat maxPendingDeepWork).
+	if tasks, err := h.Store.ListActiveTasks(ctx, "su", 50); err == nil {
+		pending := 0
+		for _, t := range tasks {
+			if t.Kind == "deep_work" {
+				pending++
+			}
+		}
+		if pending >= maxPendingDeepWork {
+			log.Printf("[DEFER] DITOLAK: sudah ada %d tugas berat mengantre (batas %d) — brief: %q",
+				pending, maxPendingDeepWork, truncateRunes(brief, 80))
+			return
+		}
+	}
+
+	delay := deferDelay(a.DeferMinutes)
+
+	label := strings.TrimSpace(a.ReminderLabel)
+	if label == "" {
+		label = truncateRunes(brief, 60)
+	}
+	if r := []rune(label); len(r) > 80 {
+		label = string(r[:80])
+	}
+
+	id, err := h.Store.CreateScheduledTask(ctx, model.ScheduledTask{
+		FireAt: time.Now().Add(delay), Kind: "deep_work", Note: brief, CreatedBy: "su", Label: label,
+	})
+	if err != nil {
+		log.Printf("[DEFER] simpan tugas berat gagal: %v", err)
+		return
+	}
+	log.Printf("[DEFER] tugas berat #%d dijadwalkan %s: %q", id,
+		time.Now().Add(delay).In(wibZone).Format("15:04 WIB"), truncateRunes(brief, 80))
+}
+
 // buildReminderInstruction merangkai instruksi (giliran sistem) untuk orchestrator:
 // ia menyusun sendiri pesan WhatsApp yang natural berdasarkan isi pengingat.
 func buildReminderInstruction(task model.ScheduledTask) string {
@@ -239,7 +363,16 @@ func buildReminderInstruction(task model.ScheduledTask) string {
 // - Penyusunan lebih awal, pengiriman tepat pada releaseAt
 // - Tanpa actions (murni notifikasi, bebas efek samping)
 // - Reusable untuk notifikasi proaktif lain
-func (h *Handler) pushToOrchestrator(ctx context.Context, task string, releaseAt time.Time) error {
+// pushOpts mengatur perilaku satu push terjadwal. Nilai nol = perilaku lama
+// (tahan sampai releaseAt, timeout client default, action DIBUANG) sehingga jalur
+// pengingat & digest yang sudah berjalan tidak berubah sedikit pun.
+type pushOpts struct {
+	releaseAt    time.Time     // tahan pesan sampai waktu ini
+	timeout      time.Duration // 0 = pakai timeout client default
+	applyActions bool
+}
+
+func (h *Handler) pushToOrchestrator(ctx context.Context, task string, opts pushOpts) error {
 	if strings.TrimSpace(h.SUPhone) == "" {
 		return errors.New("SU phone kosong")
 	}
@@ -277,7 +410,11 @@ func (h *Handler) pushToOrchestrator(ctx context.Context, task string, releaseAt
 		}
 	}
 
-	reply, meta, err := h.injectWithRecovery(ctx, agentID, convID, injectMsg)
+	cl := h.OpenClaw
+	if opts.timeout > 0 {
+		cl = cl.WithTimeout(opts.timeout)
+	}
+	reply, meta, err := h.injectWithRecoveryVia(ctx, cl, agentID, convID, injectMsg)
 	if errors.Is(err, openclaw.ErrNoReply) {
 		h.logExecution(ctx, convID, agentID, contact, injectMsg, nil, meta, "no_reply", "")
 		return errors.New("orchestrator memilih diam")
@@ -295,11 +432,18 @@ func (h *Handler) pushToOrchestrator(ctx context.Context, task string, releaseAt
 
 	// TAHAN sampai tepat waktu: pesan sudah disusun di atas (lambat), sekarang
 	// tunggu sisa waktu sampai fire_at lalu kirim — agar pengingat tidak telat.
-	if wait := time.Until(releaseAt); wait > 0 {
+	if wait := time.Until(opts.releaseAt); wait > 0 {
 		log.Printf("[SCHEDULER] pesan siap, ditahan %s sampai jatuh tempo", wait.Round(time.Second))
 	}
-	if err := holdUntil(ctx, releaseAt); err != nil {
+	if err := holdUntil(ctx, opts.releaseAt); err != nil {
 		return fmt.Errorf("penahanan dibatalkan: %w", err)
+	}
+
+	// Action dijalankan SEBELUM teks dikirim agar lampiran (SEND_DOCUMENT) sampai
+	// bersama laporannya, bukan menyusul setelahnya.
+	if opts.applyActions && len(reply.Actions) > 0 {
+		log.Printf("[PUSH-SU] menjalankan %d action dari balasan terjadwal", len(reply.Actions))
+		h.applyActions(ctx, convID, contact, reply.Actions, execID, task)
 	}
 
 	// Simpan memori SEBELUM kirim agar konteks tetap konsisten bila kirim gagal.
@@ -316,11 +460,8 @@ func (h *Handler) pushToOrchestrator(ctx context.Context, task string, releaseAt
 	return nil
 }
 
-// reconcileUnfinalizedOfflineMeetings menutup lubang operasional: meeting offline yang
-// waktunya sudah disetujui SU DAN lokasinya sudah dikonfirmasi Bu Nova, tetapi finalisasinya
-// (event kalender + undangan + konfirmasi eksternal) tertahan — mis. proses sebelumnya
-// terputus. Dipanggil sekali saat start-up; idempoten (finalizeOfflineMeeting melewati
-// meeting yang sudah 'scheduled').
+// reconcileUnfinalizedOfflineMeetings: tuntaskan meeting offline yang disetujui tapi
+// belum difinalisasi. Dipanggil sekali saat start-up; idempoten.
 func (h *Handler) reconcileUnfinalizedOfflineMeetings(ctx context.Context) {
 	if h.Store == nil {
 		return
@@ -349,10 +490,9 @@ func (h *Handler) reminderLead() int {
 	return 15
 }
 
-// scheduleMeetingReminder membuat pengingat otomatis untuk satu meeting yang baru
-// dijadwalkan: lead menit sebelum waktu mulai. Idempoten terhadap reschedule —
-// pengingat lama yang masih pending dibatalkan dulu lalu dibuat ulang dengan jadwal
-// terbaru. Aman dipanggil walau Services/Calendar nonaktif.
+// scheduleMeetingReminder membuat pengingat otomatis meeting (lead menit sebelum).
+// Idempoten terhadap reschedule: batalkan yang lama dan buat yang baru.
+// Aman dipanggil walau Services/Calendar nonaktif.
 func (h *Handler) scheduleMeetingReminder(ctx context.Context, m *model.MeetingRequest, det meetingDetails) {
 	if m == nil || m.ProposedDatetime == nil {
 		return
@@ -404,10 +544,7 @@ func buildMeetingReminderNote(title, who string, m *model.MeetingRequest, det me
 	return b.String()
 }
 
-// remindExternalForMeeting mengirim pengingat meeting ke pihak EKSTERNAL via WhatsApp,
-// melengkapi push pengingat ke SU. Pesan bersifat template (deterministik, tanpa LLM) agar
-// andal. Menahan sampai releaseAt lalu kirim ke chat eksternal. No-op bila meeting tidak
-// ditemukan, sudah lewat, atau tak punya chat eksternal.
+// remindExternalForMeeting mengirim pengingat meeting ke eksternal via WhatsApp setelah releaseAt.
 func (h *Handler) remindExternalForMeeting(ctx context.Context, meetingID int64, releaseAt time.Time) {
 	if h.Store == nil {
 		return
@@ -468,9 +605,7 @@ func buildExternalReminderText(who, title string, m *model.MeetingRequest, det m
 	return b.String()
 }
 
-// setReminder menjalankan action SET_REMINDER: SU (lewat orchestrator) meminta
-// pengingat pada waktu tertentu. Hanya inisiator ber-trust 'su' yang diizinkan
-// (gerbang keamanan — agar agent/kontak lain tidak bisa menjadwalkan pesan ke SU).
+// setReminder mengeksekusi SET_REMINDER dengan validasi trust level 'su'.
 func (h *Handler) setReminder(ctx context.Context, initiator *model.Contact, a model.Action) {
 	if initiator == nil || initiator.TrustLevel != "su" {
 		trust := "(nil)"
@@ -512,8 +647,6 @@ func (h *Handler) setReminder(ctx context.Context, initiator *model.Contact, a m
 			log.Printf("[REMINDER] weekly butuh recurDow 0-6 — diabaikan (dapat %v)", a.RecurDow)
 			return
 		}
-		// Kejadian PERTAMA: pakai ReminderTime bila diberikan & valid, jika tidak
-		// turunkan dari parameter rekurensi (slot berikutnya dari sekarang).
 		first := when
 		if err != nil { // ReminderTime tak diberikan/valid → turunkan
 			t, ok := nextOccurrence(model.ScheduledTask{RecurKind: recurKind, RecurTime: a.RecurTime, RecurDow: a.RecurDow}, time.Now())
@@ -559,10 +692,8 @@ func (h *Handler) setReminder(ctx context.Context, initiator *model.Contact, a m
 		when.In(wibZone).Format("2006-01-02 15:04 WIB"), note)
 }
 
-// cancelReminder menjalankan action CANCEL_REMINDER: SU (lewat orchestrator) menghentikan
-// sebuah pengingat aktif berdasarkan reminderId (dari snapshot [PENGINGAT AKTIF]). Untuk
-// pengingat berulang, ini menghentikan seluruh seri. Gerbang ganda: inisiator harus
-// ber-trust 'su' DAN CancelScheduledTask hanya menyentuh baris created_by='su'.
+// cancelReminder menjalankan action CANCEL_REMINDER: menghentikan pengingat aktif (berlaku untuk seri berulang).
+// Hanya SU yang dapat membatalkan.
 func (h *Handler) cancelReminder(ctx context.Context, initiator *model.Contact, a model.Action) {
 	if initiator == nil || initiator.TrustLevel != "su" {
 		trust := "(nil)"
@@ -588,13 +719,9 @@ func (h *Handler) cancelReminder(ctx context.Context, initiator *model.Contact, 
 	log.Printf("[REMINDER] pengingat #%d dibatalkan (seri berulang, bila ada, berhenti)", a.ReminderID)
 }
 
-// scheduleCalendarDigest menjalankan action SCHEDULE_CALENDAR_DIGEST: SU (lewat
-// orchestrator) meminta pengecekan kalender terjadwal — biasanya berulang, mis. tiap
-// hari jam 08:00. Saat jatuh tempo, worker menarik agenda hari itu dari kalender PA
-// (pa@hypernet.co.id) lalu menugaskan orchestrator menyusun ringkasan + rencana kerja
-// untuk Pak Sudianto. Hanya inisiator ber-trust 'su' (gerbang keamanan — sama seperti
-// SET_REMINDER). Disimpan sebagai scheduled_task kind="calendar_digest", created_by="su"
-// sehingga MEMAKAI ULANG mesin recurring, snapshot, dan pembatalan (CANCEL_REMINDER).
+// scheduleCalendarDigest menjalankan SCHEDULE_CALENDAR_DIGEST untuk cek kalender
+// terjadwal. Hanya inisiator trust 'su' yang boleh, dan tugas disimpan sebagai
+// scheduled_task kind="calendar_digest".
 func (h *Handler) scheduleCalendarDigest(ctx context.Context, initiator *model.Contact, a model.Action) {
 	if initiator == nil || initiator.TrustLevel != "su" {
 		trust := "(nil)"
@@ -604,8 +731,7 @@ func (h *Handler) scheduleCalendarDigest(ctx context.Context, initiator *model.C
 		log.Printf("[DIGEST] DITOLAK: inisiator non-SU (trust=%s)", trust)
 		return
 	}
-	// Fokus opsional dari SU (mis. "susun rencana kerja") disimpan di Note, lalu
-	// disuntik ke instruksi saat fire. Boleh kosong.
+	// Fokus opsional dari SU (mis. "susun rencana kerja") disimpan di Note
 	focus := firstNonEmptyStr(strings.TrimSpace(a.ReminderNote), strings.TrimSpace(a.Task))
 	label := strings.TrimSpace(a.ReminderLabel)
 	if label == "" {
@@ -635,8 +761,6 @@ func (h *Handler) scheduleCalendarDigest(ctx context.Context, initiator *model.C
 			log.Printf("[DIGEST] weekly butuh recurDow 0-6 — diabaikan (dapat %v)", a.RecurDow)
 			return
 		}
-		// Kejadian PERTAMA: pakai ReminderTime bila valid, jika tidak turunkan dari
-		// parameter rekurensi (slot berikutnya dari sekarang).
 		first := when
 		if terr != nil {
 			t, ok := nextOccurrence(model.ScheduledTask{RecurKind: recurKind, RecurTime: a.RecurTime, RecurDow: a.RecurDow}, time.Now())
@@ -682,11 +806,8 @@ func (h *Handler) scheduleCalendarDigest(ctx context.Context, initiator *model.C
 		when.In(wibZone).Format("2006-01-02 15:04 WIB"))
 }
 
-// buildCalendarDigestInstruction menyusun instruksi (giliran sistem) untuk orchestrator
-// saat sebuah digest kalender jatuh tempo: menarik agenda HARI INI langsung dari kalender
-// PA lalu meminta orchestrator meringkasnya dan menyusun rencana kerja untuk Pak Sudianto.
-// Bila layanan kalender nonaktif/gagal, instruksi tetap dikirim dengan catatan agar SU
-// tetap mendapat kabar (bukan diam).
+// buildCalendarDigestInstruction menyusun instruksi orchestrator untuk digest kalender:
+// mengambil agenda hari ini dari kalender PA dan meminta orchestrator meringkasnya.
 func (h *Handler) buildCalendarDigestInstruction(ctx context.Context, task model.ScheduledTask) string {
 	now := time.Now().In(wibZone)
 	date := now.Format("2006-01-02")
@@ -748,9 +869,7 @@ func formatCalendarAgenda(evs []services.AvailabilityEvent) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// buildReminderSnapshot merakit ringkasan pengingat AKTIF milik SU langsung dari
-// PostgreSQL untuk disisipkan ke konteks orchestrator — sehingga SU bisa menanyakan
-// & membatalkannya (CANCEL_REMINDER) tanpa perlu action LIST khusus.
+// Ringkasan pengingat aktif SU dari PostgreSQL untuk konteks orchestrator.
 func (h *Handler) buildReminderSnapshot(ctx context.Context) string {
 	if h.Store == nil {
 		return ""
@@ -778,8 +897,11 @@ func (h *Handler) buildReminderSnapshot(ctx context.Context) string {
 			label = truncateRunes(t.Note, 40)
 		}
 		kindTag := ""
-		if t.Kind == "calendar_digest" {
+		switch t.Kind {
+		case "calendar_digest":
 			kindTag = " [digest kalender]"
+		case "deep_work":
+			kindTag = " [tugas tertunda — sedang/akan dikerjakan]"
 		}
 		rows = append(rows, fmt.Sprintf("- reminderId=%d | %s%s | mulai %s%s", t.ID, label, kindTag, when, recur))
 	}

@@ -41,6 +41,24 @@ ARG CLAUDE_CODE_VERSION=""
 RUN curl -fsSL https://claude.ai/install.sh | bash -s -- ${CLAUDE_CODE_VERSION:+"$CLAUDE_CODE_VERSION"} \
     && claude --version
 
+RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+      python3 python3-pip python3-venv \
+      libpango-1.0-0 libpangoft2-1.0-0 libcairo2 libgdk-pixbuf-2.0-0 \
+      fonts-dejavu-core \
+    && sudo rm -rf /var/lib/apt/lists/*
+
+ENV PA_VENV=/opt/pa-tools
+RUN sudo mkdir -p ${PA_VENV} && sudo chown claw:claw ${PA_VENV} \
+    && python3 -m venv ${PA_VENV} \
+    && ${PA_VENV}/bin/pip install --no-cache-dir --upgrade pip \
+    && ${PA_VENV}/bin/pip install --no-cache-dir \
+         openpyxl XlsxWriter \
+         python-docx python-pptx \
+         weasyprint reportlab \
+         matplotlib pandas Pillow \
+    && ${PA_VENV}/bin/python -c "import openpyxl, docx, pptx, weasyprint, reportlab, matplotlib, pandas, PIL; print('perkakas dokumen OK')"
+ENV PATH="${PA_VENV}/bin:${PATH}"
+
 WORKDIR /app/gateway
 COPY --chown=claw:claw --from=gobuild /out/api-gateway ./api-gateway
 COPY --chown=claw:claw services/api-gateway/assets ./assets

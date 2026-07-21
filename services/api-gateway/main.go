@@ -66,7 +66,7 @@ func main() {
 		cfg.MSGraphUserUPN, cfg.MSGraphRefreshToken, cfg.MailFromName, cfg.SignaturePath,
 	)
 
-	h := &routes.Handler{Waha: wahaClient, Store: store, OpenClaw: openClawClient, Memory: mem, Services: svcClient, SUPhone: cfg.SUPhone, NovaPhone: cfg.NovaPhone, ReminderLeadMinutes: cfg.ReminderLeadMinutes, AlertEmailTo: cfg.AlertEmailTo, AlertWebhookToken: cfg.AlertWebhookToken}
+	h := &routes.Handler{Waha: wahaClient, Store: store, OpenClaw: openClawClient, Memory: mem, Services: svcClient, SUPhone: cfg.SUPhone, NovaPhone: cfg.NovaPhone, ReminderLeadMinutes: cfg.ReminderLeadMinutes, AlertEmailTo: cfg.AlertEmailTo, AlertWebhookToken: cfg.AlertWebhookToken, DocWorkDir: cfg.DocWorkDir}
 	admin := &routes.AdminHandler{Store: store, Gateway: h}
 
 	// --- Worker pengingat: kirim tugas terjadwal ke SU saat jatuh tempo ---
@@ -74,6 +74,9 @@ func main() {
 
 	// --- Worker pantauan email: periksa inbox berkala, lapor email yang cocok ---
 	h.StartEmailWatcher(ctx)
+
+	// --- Auto sanitizer ---
+	h.StartDocJanitor(ctx)
 
 	// --- Kolektor metrik operasional
 	h.StartHealthCollector(ctx)

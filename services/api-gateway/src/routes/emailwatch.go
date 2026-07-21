@@ -167,7 +167,7 @@ func (h *Handler) evaluateWatch(ctx context.Context, w model.EmailWatch, emails 
 			candidates = candidates[:maxWatchCandidates]
 		}
 		instruction := buildEmailWatchInstruction(w, candidates, sentIdx, sentKnown)
-		err := h.pushToOrchestrator(ctx, instruction, time.Time{})
+		err := h.pushToOrchestrator(ctx, instruction, pushOpts{})
 		switch {
 		case err == nil:
 			log.Printf("[EMAILWATCH] pantauan #%d: %d kandidat dilaporkan ke SU", w.ID, len(candidates))
@@ -384,7 +384,7 @@ func (h *Handler) readEmails(initiator *model.Contact, a model.Action) {
 // pushEmailReadResult menyuntik instruksi hasil cek email ke orchestrator agar disampaikan
 // ke SU.
 func (h *Handler) pushEmailReadResult(ctx context.Context, instruction string) {
-	if err := h.pushToOrchestrator(ctx, instruction, time.Time{}); err != nil {
+	if err := h.pushToOrchestrator(ctx, instruction, pushOpts{}); err != nil {
 		log.Printf("[EMAILREAD] sampaikan hasil ke SU gagal: %v", err)
 		return
 	}

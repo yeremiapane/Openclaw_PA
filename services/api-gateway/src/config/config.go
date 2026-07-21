@@ -72,6 +72,10 @@ type Config struct {
 	MSGraphRefreshToken string
 	MailFromName        string // nama tampilan pengirim
 	SignaturePath       string // path signature.html untuk email
+
+	// DocWorkDir = direktori kerja untuk SEND_DOCUMENT `docPath`.
+	// Path di luar direktori ini ditolak.
+	DocWorkDir string
 }
 
 // DBConnString merakit DSN PostgreSQL dari komponen Config.
@@ -139,6 +143,17 @@ func Load() Config {
 		MSGraphRefreshToken: getenv("MS_GRAPH_REFRESH_TOKEN", ""),
 		MailFromName:        getenv("FROM_NAME", "PA Asisten"),
 		SignaturePath:       getenv("SIGNATURE_PATH", "assets/signature.html"),
+
+		DocWorkDir: getenv("DOC_WORK_DIR", filepath.Join(os.TempDir(), "pa_ai_outbox")),
+	}
+	if abs, err := filepath.Abs(cfg.DocWorkDir); err == nil {
+		cfg.DocWorkDir = abs
+	}
+	if err := os.MkdirAll(cfg.DocWorkDir, 0o755); err != nil {
+		log.Printf("[config] PERINGATAN: gagal menyiapkan DOC_WORK_DIR %s: %v — SEND_DOCUMENT jalur docPath nonaktif", cfg.DocWorkDir, err)
+		cfg.DocWorkDir = ""
+	} else {
+		log.Printf("[config] DOC_WORK_DIR = %s", cfg.DocWorkDir)
 	}
 
 	if cfg.WahaAPIKey == "" {

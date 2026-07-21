@@ -41,6 +41,11 @@ type Handler struct {
 	// Alerting (Fase M3b): tujuan email notifikasi alert & Bearer token webhook.
 	AlertEmailTo      string
 	AlertWebhookToken string
+
+	// DocWorkDir = direktori kerja bersama gateway↔agent untuk SEND_DOCUMENT jalur
+	// `docPath` (berkas biner: XLSX/PDF/PPTX). Sekaligus batas keamanan: gateway
+	// menolak membaca path di luar direktori ini. Kosong = jalur docPath nonaktif.
+	DocWorkDir string
 }
 
 // agentForTrust memetakan trust_level kontak ke agent OpenClaw (Fase 8 routing).
@@ -155,6 +160,9 @@ func (h *Handler) process(contact *model.Contact, agentID, convID, from, text, r
 					mc.LiveStatus += "\n\n" + snap
 				}
 				if snap := h.buildPersonaSnapshot(ctx); snap != "" {
+					mc.LiveStatus += "\n\n" + snap
+				}
+				if snap := h.buildDocWorkDirSnapshot(); snap != "" {
 					mc.LiveStatus += "\n\n" + snap
 				}
 				if replyTo != "" {
@@ -485,18 +493,30 @@ func isParseErr(err error) bool {
 
 // injectWithRecovery: coba normal, retry sekali dengan dorongan JSON, lalu reset sesi jika parse_error.
 func (h *Handler) injectWithRecovery(ctx context.Context, agentID, convID, message string) (*openclaw.AgentReply, *openclaw.RunMeta, error) {
+	return h.injectWithRecoveryVia(ctx, h.OpenClaw, agentID, convID, message)
+}
+
+// injectWithRecoveryVia sama dengan injectWithRecovery tetapi memakai client yang
+// diberikan — jalur kerja berat (DEFER_TASK) menyerahkan client ber-timeout panjang.
+func (h *Handler) injectWithRecoveryVia(ctx context.Context, cl *openclaw.Client, agentID, convID, message string) (*openclaw.AgentReply, *openclaw.RunMeta, error) {
 	sk := convID
 	if h.Memory != nil {
 		sk = h.Memory.OCSessionKey(ctx, convID)
 	}
-	reply, meta, err := h.OpenClaw.InjectAgent(ctx, agentID, sk, message)
+	reply, meta, err := cl.InjectAgent(ctx, agentID, sk, message)
 	if !isParseErr(err) {
 		return reply, meta, err
 	}
 
 	// (2) retry pada sesi sama dengan dorongan kepatuhan JSON.
-	log.Printf("[RECOVERY] parse_error conv=%s sk=%s — retry dorongan JSON (sesi sama)", convID, sk)
-	reply, meta, err = h.OpenClaw.InjectAgent(ctx, agentID, sk, message+jsonNudge)
+	// Bila bootstrap terpotong, itu penyebab paling mungkin: kontrak JSON ada di
+	// ekor SOUL.md yang hilang. Cantumkan di log agar korelasinya kelihatan langsung.
+	trunc := ""
+	if meta != nil && len(meta.TruncatedBootstrap) > 0 {
+		trunc = " — DIDUGA bootstrap terpotong: " + strings.Join(meta.TruncatedBootstrap, ", ")
+	}
+	log.Printf("[RECOVERY] parse_error conv=%s sk=%s — retry dorongan JSON (sesi sama)%s", convID, sk, trunc)
+	reply, meta, err = cl.InjectAgent(ctx, agentID, sk, message+jsonNudge)
 	if !isParseErr(err) {
 		return reply, meta, err
 	}
@@ -510,7 +530,7 @@ func (h *Handler) injectWithRecovery(ctx context.Context, agentID, convID, messa
 			sk = nsk
 		}
 	}
-	reply, meta, err = h.OpenClaw.InjectAgent(ctx, agentID, sk, message+jsonNudge)
+	reply, meta, err = cl.InjectAgent(ctx, agentID, sk, message+jsonNudge)
 	if isParseErr(err) {
 		log.Printf("[RECOVERY] GAGAL conv=%s — masih parse_error setelah retry+reset", convID)
 	} else if err == nil {
@@ -863,6 +883,12 @@ func (h *Handler) applyActions(ctx context.Context, convID string, contact *mode
 			// SENDIRI isi & format-nya; gateway hanya mengemas jadi file & mengirim ke
 			// SU. Hanya boleh dari percakapan SU (gerbang di sendDocument).
 			h.sendDocument(ctx, convID, contact, a, execID)
+		case "DEFER_TASK":
+			// SU (lewat orchestrator) minta pekerjaan BERAT — riset, penelusuran banyak
+			// sumber, penyusunan laporan — dikerjakan di latar belakang. Giliran sekarang
+			// tetap membalas Pak Sudianto seketika; pekerjaannya dijalankan worker dengan
+			// anggaran waktu jauh lebih besar, lalu hasilnya di-push. Gerbang SU di deferTask.
+			h.deferTask(ctx, contact, a)
 		case "UPDATE_AGENT_PERSONA":
 			// SU (lewat orchestrator) menyesuaikan GAYA & sebagian perilaku ringan agent.
 			// Disimpan sebagai overlay & disuntik sebagai konteks tiap giliran;

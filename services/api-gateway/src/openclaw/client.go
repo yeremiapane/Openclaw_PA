@@ -114,22 +114,34 @@ func (u Usage) Total() int { return u.Input + u.Output + u.CacheRead + u.CacheWr
 
 // RunMeta menyimpan metadata observability satu giliran agent.
 type RunMeta struct {
-	RunID             string
-	Status            string
-	OCSessionID       string
-	SessionKey        string
-	Provider          string
-	Model             string
-	Usage             Usage
-	FinishReason      string
-	StopReason        string
-	Refusal           bool
-	DurationMs        int
-	SystemPromptChars int
-	PromptChars       int
-	FallbackUsed      bool
-	Runner            string
-	ExecutionTrace    json.RawMessage
+	RunID              string
+	Status             string
+	OCSessionID        string
+	SessionKey         string
+	Provider           string
+	Model              string
+	Usage              Usage
+	FinishReason       string
+	StopReason         string
+	Refusal            bool
+	DurationMs         int
+	SystemPromptChars  int
+	PromptChars        int
+	FallbackUsed       bool
+	Runner             string
+	ExecutionTrace     json.RawMessage
+	TruncatedBootstrap []string
+	ToolsAvailable     []string
+}
+
+// HasTool melaporkan apakah tool bernama name tersedia untuk giliran ini.
+func (m *RunMeta) HasTool(name string) bool {
+	for _, t := range m.ToolsAvailable {
+		if t == name {
+			return true
+		}
+	}
+	return false
 }
 
 type meta struct {
@@ -158,6 +170,22 @@ type meta struct {
 		CurrentTurn struct {
 			PromptChars int `json:"promptChars"`
 		} `json:"currentTurn"`
+		// bootstrapTruncation + injectedWorkspaceFiles: metadata pemangkasan bootstrap
+		// dan file terinjeksi selalu dikirim.
+		BootstrapTruncation struct {
+			TruncatedFiles int `json:"truncatedFiles"`
+		} `json:"bootstrapTruncation"`
+		InjectedWorkspaceFiles []struct {
+			Name          string `json:"name"`
+			RawChars      int    `json:"rawChars"`
+			InjectedChars int    `json:"injectedChars"`
+			Truncated     bool   `json:"truncated"`
+		} `json:"injectedWorkspaceFiles"`
+		Tools struct {
+			Entries []struct {
+				Name string `json:"name"`
+			} `json:"entries"`
+		} `json:"tools"`
 	} `json:"systemPromptReport"`
 	ExecutionTrace struct {
 		WinnerProvider string `json:"winnerProvider"`
@@ -223,6 +251,19 @@ func (e *envelope) runMeta() *RunMeta {
 		"promptChars":       spr.CurrentTurn.PromptChars,
 		"sessionKey":        spr.SessionKey,
 	})
+
+	// Rekam file bootstrap yang terpotong — sumber diam parse_error & riset gagal.
+	for _, f := range spr.InjectedWorkspaceFiles {
+		if f.Truncated {
+			rm.TruncatedBootstrap = append(rm.TruncatedBootstrap,
+				fmt.Sprintf("%s %d→%d", f.Name, f.RawChars, f.InjectedChars))
+		}
+	}
+	for _, e := range spr.Tools.Entries {
+		if e.Name != "" {
+			rm.ToolsAvailable = append(rm.ToolsAvailable, e.Name)
+		}
+	}
 	return rm
 }
 
@@ -235,9 +276,18 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-// Inject menjalankan satu turn agent untuk sessionKey tertentu dan mengembalikan
-// balasan terstruktur. sessionKey mengisolasi percakapan per kontak
-// (format: "agent:pa_communicator:<id>").
+// WithTimeout mengembalikan salinan client dengan timeout berbeda untuk satu turn.
+// Dipakai untuk jalur kerja berat yang butuh waktu lebih lama.
+func (c *Client) WithTimeout(d time.Duration) *Client {
+	if d <= 0 {
+		return c
+	}
+	cp := *c
+	cp.timeout = d
+	return &cp
+}
+
+// Inject menjalankan satu turn untuk sessionKey tertentu.
 func (c *Client) Inject(ctx context.Context, sessionKey, message string) (*AgentReply, *RunMeta, error) {
 	return c.InjectAgent(ctx, c.agentID, sessionKey, message)
 }
@@ -268,6 +318,12 @@ func (c *Client) InjectAgent(ctx context.Context, agentID, sessionKey, message s
 		return nil, &RunMeta{}, fmt.Errorf("parse envelope CLI gagal: %w (raw: %s)", perr, truncate(string(out), 600))
 	}
 	rm := env.runMeta()
+
+	// Peringatkan jika bootstrap terpotong; naikkan bootstrapMaxChars atau pangkas/pisah SOUL.md.
+	if len(rm.TruncatedBootstrap) > 0 {
+		log.Printf("[OPENCLAW][WARN] bootstrap TERPOTONG sk=%s: %s — kontrak JSON/aturan di ekor file bisa hilang; naikkan bootstrapMaxChars",
+			sessionKey, strings.Join(rm.TruncatedBootstrap, ", "))
+	}
 
 	text, err := payloadText(&env, out)
 	if err != nil {

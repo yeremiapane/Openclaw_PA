@@ -9,9 +9,13 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"regexp"
 	"time"
 )
+
+// maxInboundMediaBytes = batas ukuran file masuk yang diunduh dari WAHA.
+const maxInboundMediaBytes = 16 << 20 // 16 MiB
 
 var nonDigit = regexp.MustCompile(`\D`)
 
@@ -192,6 +196,50 @@ func (c *Client) ResolvePhoneByLid(lid string) (string, error) {
 		return "", err
 	}
 	return nonDigit.ReplaceAllString(out.PN, ""), nil
+}
+
+// DownloadMedia mengunduh file media dari WAHA. rawURL adalah payload.media.url
+// yang memakai host INTERNAL WAHA (mis. http://localhost:3000/...); host-nya
+// ditulis-ulang ke baseURL client agar terjangkau dari lingkungan ini (dev:
+// localhost:13000, prod: waha:3000). WAHA menuntut X-Api-Key (401 tanpa). File
+// bersifat FANA (~WHATSAPP_FILES_LIFETIME) → panggil segera saat webhook tiba.
+// Mengembalikan byte file + Content-Type dari respons.
+func (c *Client) DownloadMedia(rawURL string) ([]byte, string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, "", fmt.Errorf("URL media invalid: %w", err)
+	}
+	dl := c.baseURL + u.Path
+	if u.RawQuery != "" {
+		dl += "?" + u.RawQuery
+	}
+
+	req, err := http.NewRequest(http.MethodGet, dl, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("X-Api-Key", c.apiKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("unduh media dari WAHA gagal: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, "", fmt.Errorf("WAHA download HTTP %d: %s", resp.StatusCode, string(b))
+	}
+
+	// Baca sampai batas+1 untuk mendeteksi file yang melampaui batas.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxInboundMediaBytes+1))
+	if err != nil {
+		return nil, "", fmt.Errorf("baca media gagal: %w", err)
+	}
+	if len(data) > maxInboundMediaBytes {
+		return nil, "", fmt.Errorf("media terlalu besar (> %d byte)", maxInboundMediaBytes)
+	}
+	return data, resp.Header.Get("Content-Type"), nil
 }
 
 // ── Presence (indikator baca & "mengetik…") ───────────────────────

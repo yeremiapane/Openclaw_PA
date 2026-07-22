@@ -125,18 +125,41 @@ func (h *Handler) WahaInbound(c *gin.Context) {
 	// agent lain mengabaikannya. Diekstrak di sini selagi event masih tersedia.
 	replyTo := ev.ReplyToText()
 
+	// Lampiran media (dokumen/gambar). Diekstrak selagi event tersedia; unduhan
+	// & analisa dilakukan di process(). Hanya file dari SU yang diproses (gerbang
+	// di process) — file eksternal diabaikan demi keamanan (anti prompt-injection).
+	var file *inboundFile
+	if ev.HasFile() {
+		file = &inboundFile{
+			URL:      ev.Payload.Media.URL,
+			Mimetype: ev.Payload.Media.Mimetype,
+			Filename: ev.MediaFilename(),
+		}
+	}
+
 	// Proses inject + kirim balasan di luar request lifecycle WAHA.
-	go h.process(contact, agentID, convID, from, text, replyTo)
+	go h.process(contact, agentID, convID, from, text, replyTo, file)
 
 	c.JSON(http.StatusOK, gin.H{"status": "received"})
 }
 
-func (h *Handler) process(contact *model.Contact, agentID, convID, from, text, replyTo string) {
+func (h *Handler) process(contact *model.Contact, agentID, convID, from, text, replyTo string, file *inboundFile) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 	typingCtx, stopTyping := context.WithCancel(ctx)
 	go h.typingKeepAlive(typingCtx, from)
 	defer stopTyping()
+
+	// Lampiran file: unduh, simpan ke direktori kerja, dan ubah `text` menjadi
+	// instruksi baca-berkas untuk orchestrator. HANYA untuk SU (keamanan: dokumen
+	// eksternal bisa memuat prompt-injection dan tak boleh diumpankan otomatis).
+	if file != nil {
+		if contact.TrustLevel == "su" {
+			text = h.ingestInboundFile(ctx, convID, text, file)
+		} else {
+			log.Printf("[FILE] lampiran dari non-SU (trust=%s) diabaikan", contact.TrustLevel)
+		}
+	}
 
 	injectMsg := text
 	if h.Memory != nil {
@@ -1999,8 +2022,7 @@ func (h *Handler) notifyOrchestrator(ctx context.Context, convID string, contact
 }
 
 // markVenueCoordination memastikan sebuah meeting offline ditandai venue-coordination
-// pada details-nya (idempoten), tanpa mengubah status/jadwal. Menandakan finalisasi
-// harus ditahan sampai lokasi pasti dikonfirmasi Bu Nova.
+// pada details-nya (idempoten), tanpa mengubah status/jadwal.
 func (h *Handler) markVenueCoordination(ctx context.Context, m *model.MeetingRequest) {
 	if h.Store == nil || m == nil {
 		return
@@ -2157,12 +2179,9 @@ func (h *Handler) deferMeetingForVenue(ctx context.Context, existing *model.Meet
 	h.presentTimeApprovalToSU(ctx, existing.ID)
 }
 
-// presentTimeApprovalToSU mengajukan WAKTU yang sudah disepakati pihak eksternal ke SU
-// untuk persetujuan — TAHAP PERTAMA alur meeting offline yang baru. Lokasi BELUM
-// dikoordinasikan pada titik ini; koordinasi Bu Nova dipicu setelah SU menyetujui waktu
-// (DecideApproval). Pesan tertahan = kabar ke pihak eksternal bahwa waktu sudah disetujui
-// (lokasi menyusul), dikirim saat SU menyetujui. Idempoten: tidak mengajukan ulang bila
-// meeting sudah tertaut approval.
+// presentTimeApprovalToSU mengajukan waktu yang disepakati pihak eksternal ke SU untuk
+// persetujuan. Lokasi belum dikomunikasikan; koordinasi venue dilakukan setelah SU
+// menyetujui. Idempoten: tidak mengajukan ulang bila meeting sudah tertaut approval.
 func (h *Handler) presentTimeApprovalToSU(ctx context.Context, meetingID int64) {
 	if h.Store == nil {
 		return

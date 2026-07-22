@@ -4,6 +4,8 @@ package model
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"path"
 	"strings"
 	"time"
 )
@@ -18,6 +20,12 @@ type WahaEvent struct {
 		From      string `json:"from"`
 		FromMe    bool   `json:"fromMe"`
 		Body      string `json:"body"`
+		// HasMedia + Media terisi bila pesan membawa lampiran (dokumen/gambar/video).
+		// WAHA GOWS mengirim URL file (host internal, mis. localhost:3000) di Media.URL;
+		// unduh via waha.Client.DownloadMedia yang menulis-ulang host. Filename hanya
+		// ada untuk DOKUMEN; gambar/video tak membawanya (diturunkan dari basename URL).
+		HasMedia bool          `json:"hasMedia"`
+		Media    *MediaPayload `json:"media"`
 		// VCards berisi kartu kontak terlampir (mis. SU mengirim kontak orang yang
 		// ingin dijadwalkan). Tiap elemen = satu kartu vCard mentah. WAHA NOWEB
 		// menyatukan kontak tunggal & jamak ke array ini; `body` kosong saat ini.
@@ -44,6 +52,35 @@ type WahaEvent struct {
 			HasMedia    bool   `json:"hasMedia"`
 		} `json:"replyTo"`
 	} `json:"payload"`
+}
+
+// MediaPayload
+type MediaPayload struct {
+	URL      string `json:"url"`
+	Filename string `json:"filename"`
+	Mimetype string `json:"mimetype"`
+	Error    string `json:"error"`
+}
+
+// HasFile true bila pesan membawa lampiran media yang bisa diunduh (URL ada, tanpa error).
+func (e *WahaEvent) HasFile() bool {
+	m := e.Payload.Media
+	return m != nil && strings.TrimSpace(m.URL) != "" && strings.TrimSpace(m.Error) == ""
+}
+
+// MediaFilename mengembalikan nama berkas media masuk
+func (e *WahaEvent) MediaFilename() string {
+	m := e.Payload.Media
+	if m == nil {
+		return ""
+	}
+	if name := strings.TrimSpace(m.Filename); name != "" {
+		return name
+	}
+	if u, err := url.Parse(m.URL); err == nil {
+		return path.Base(u.Path)
+	}
+	return ""
 }
 
 // maxReplyPreview membatasi panjang kutipan pesan yang dibalas agar preamble

@@ -3,7 +3,7 @@ package db
 import "context"
 
 // CountScheduledTasksByStatus mengembalikan jumlah tugas terjadwal dikelompokkan per
-// status (pending/fired/error/cancelled). Dipakai kolektor metrik (Fase M4) untuk
+// status (pending/fired/error/cancelled). Dipakai kolektor metrik untuk
 // mengekspos gateway_scheduled_tasks — mis. memantau tugas yang gagal terkirim (error).
 func (s *Store) CountScheduledTasksByStatus(ctx context.Context) (map[string]int, error) {
 	rows, err := s.pool.Query(ctx, `
@@ -27,7 +27,7 @@ func (s *Store) CountScheduledTasksByStatus(ctx context.Context) (map[string]int
 }
 
 // CountPendingApprovals mengembalikan jumlah approval (pesan keluar) yang masih
-// menunggu keputusan SU. Dipakai kolektor metrik (Fase M4) untuk gateway_pending_approvals.
+// menunggu keputusan SU. Dipakai kolektor metrik untuk gateway_pending_approvals.
 func (s *Store) CountPendingApprovals(ctx context.Context) (int, error) {
 	var n int
 	err := s.pool.QueryRow(ctx, `
@@ -37,7 +37,7 @@ func (s *Store) CountPendingApprovals(ctx context.Context) (int, error) {
 }
 
 // PoolStats mengembalikan statistik pool koneksi pgx: koneksi terpakai (acquired),
-// menganggur (idle), total, dan batas maksimum. Dipakai kolektor metrik (Fase M5)
+// menganggur (idle), total, dan batas maksimum. Dipakai kolektor metrik
 // untuk mendeteksi pool yang nyaris habis (acquired mendekati max).
 func (s *Store) PoolStats() (acquired, idle, total, max int32) {
 	st := s.pool.Stat()

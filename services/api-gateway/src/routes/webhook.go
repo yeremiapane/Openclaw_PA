@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -34,11 +35,23 @@ type Handler struct {
 	Services  *services.Client // Calendar + Email (penjadwalan saat approve)
 	SUPhone   string           // nomor Pak Sudianto — tujuan notifikasi approval & orchestrator
 	NovaPhone string
+	// AdminPhone = nomor agent admin (trust=admin). Tujuan push hasil ADMIN_FETCH &
+	// jangkar sesi agent admin. Terpisah dari SU. Kosong = agent admin nonaktif.
+	AdminPhone string
 	// ReminderLeadMinutes = berapa menit sebelum meeting mulai pengingat otomatis
 	// dikirim ke SU (default 15 bila <= 0).
 	ReminderLeadMinutes int
 
-	// Alerting (Fase M3b): tujuan email notifikasi alert & Bearer token webhook.
+	// ReadDelayMin/Max = rentang jeda ACAK sebelum menandai pesan masuk sudah dibaca
+	// (centang biru), agar terlihat manusiawi. Berlaku semua trust. Max<=0 = seketika.
+	ReadDelayMin time.Duration
+	ReadDelayMax time.Duration
+
+	// SpawnStaggerInterval = jeda antar-kontak untuk SPAWN_AGENT massal dalam satu
+	// balasan orchestrator: kontak ke-N (0-indeks) ditunda N × interval ini. 0 = serempak.
+	SpawnStaggerInterval time.Duration
+
+	// Alerting : tujuan email notifikasi alert & Bearer token webhook.
 	AlertEmailTo      string
 	AlertWebhookToken string
 
@@ -51,12 +64,15 @@ type Handler struct {
 // agentForTrust memetakan trust_level kontak ke agent OpenClaw (Fase 8 routing).
 //
 //	su            -> orchestrator (jalur langsung Pak Sudianto)
+//	admin         -> admin        (agent kendali: tarik data & kontrol operasional)
 //	semi_trusted  -> support      (koordinasi internal, mis. Bu Nova)
 //	lainnya       -> pa_communicator (pihak eksternal)
 func agentForTrust(trust string) string {
 	switch trust {
 	case "su":
 		return "orchestrator"
+	case "admin":
+		return "admin"
 	case "semi_trusted":
 		return "support"
 	default:
@@ -104,9 +120,12 @@ func (h *Handler) WahaInbound(c *gin.Context) {
 	convID := "agent:" + agentID + ":" + keyID
 	from := ev.Payload.From
 
-	// Presence: tandai pesan masuk sudah dibaca (centang biru). Best-effort &
-	// di luar jalur utama agar tak menambah latensi balasan.
+	// Presence: tandai pesan masuk sudah dibaca (centang biru) SETELAH jeda acak
+	// (READ_DELAY_MIN..MAX, semua trust)
 	go func(chatID, msgID string) {
+		if d := randReadDelay(h.ReadDelayMin, h.ReadDelayMax); d > 0 {
+			time.Sleep(d)
+		}
 		if err := h.Waha.SendSeen(chatID, msgID); err != nil {
 			log.Printf("[PRESENCE] sendSeen %s gagal: %v", chatID, err)
 		}
@@ -192,6 +211,16 @@ func (h *Handler) process(contact *model.Contact, agentID, convID, from, text, r
 					mc.LiveStatus += "\n\n[PESAN YANG SEDANG DIBALAS PAK SUDIANTO]\n" +
 						"Beliau menanggapi pesan ini: \"" + replyTo + "\"\n" +
 						"Pakai kutipan ini sebagai acuan konteks balasan beliau."
+				}
+			} else if agentID == "admin" {
+				// Agent admin: suntik status operasional menyeluruh (READ) tiap giliran.
+				if snap := h.buildAdminSnapshot(ctx); snap != "" {
+					mc.LiveStatus += "\n\n" + snap
+				}
+				if replyTo != "" {
+					mc.LiveStatus += "\n\n[PESAN YANG SEDANG DIBALAS ADMIN]\n" +
+						"Admin menanggapi pesan ini: \"" + replyTo + "\"\n" +
+						"Pakai kutipan ini sebagai acuan konteks balasan."
 				}
 			} else if agentID == "pa_communicator" {
 				if note := h.buildVenueTimeReinforcement(ctx, convID); note != "" {
@@ -573,6 +602,31 @@ func cidPtr(contact *model.Contact) *int {
 	return nil
 }
 
+// staggerDelay menghitung jeda mulai untuk SPAWN_AGENT ke-`seq` (0-indeks) dalam
+// satu batch: seq × interval. seq==0 (kontak pertama) atau interval<=0 → 0 (seketika).
+func staggerDelay(seq int, interval time.Duration) time.Duration {
+	if seq <= 0 || interval <= 0 {
+		return 0
+	}
+	return time.Duration(seq) * interval
+}
+
+// randReadDelay mengembalikan durasi acak di rentang [min, max] (inklusif) untuk
+// menunda penandaan "sudah dibaca". Bila max<=0 atau max<min→0 (tanpa jeda). Bila
+// min==max, kembalikan tepat nilai itu. Memakai rand global (auto-seeded, Go 1.20+).
+func randReadDelay(min, max time.Duration) time.Duration {
+	if max <= 0 || max < min {
+		return 0
+	}
+	if min < 0 {
+		min = 0
+	}
+	if max == min {
+		return min
+	}
+	return min + time.Duration(rand.Int63n(int64(max-min)+1))
+}
+
 // execPtr membungkus execID jadi pointer (nil bila 0).
 func execPtr(id int64) *int64 {
 	if id > 0 {
@@ -749,6 +803,28 @@ func (h *Handler) createMeetingFromApproval(ctx context.Context, convID, agentID
 		}
 	}
 
+	var spawnProp *model.MeetingRequest
+	if det.AttendeeName != "" {
+		if prop, ferr := h.Store.FindPendingSpawnMeeting(ctx, det.AttendeeName, ""); ferr != nil {
+			log.Printf("[MEETING] cari proposal SPAWN utk %q gagal: %v", det.AttendeeName, ferr)
+		} else if prop != nil {
+			spawnProp = prop
+			if via == "external" {
+				via = "su"
+				log.Printf("[MEETING] approval eksternal cocok proposal SPAWN #%d — warisi via=su (SU-initiated)", prop.ID)
+			}
+			// Wariskan email/nama dari proposal SPAWN bila giliran ini tak membawanya,
+			// supaya undangan tak jatuh ke cabang "email tidak diketahui".
+			if strings.TrimSpace(det.AttendeeEmail) == "" || strings.TrimSpace(det.AttendeeName) == "" {
+				var pd meetingDetails
+				if json.Unmarshal(prop.Details, &pd) == nil {
+					det.AttendeeEmail = firstNonEmptyStr(det.AttendeeEmail, pd.AttendeeEmail)
+					det.AttendeeName = firstNonEmptyStr(det.AttendeeName, pd.AttendeeName)
+				}
+			}
+		}
+	}
+
 	details, _ := json.Marshal(det)
 
 	apID := approvalID
@@ -762,17 +838,15 @@ func (h *Handler) createMeetingFromApproval(ctx context.Context, convID, agentID
 		log.Printf("[MEETING] buat gagal approval #%d: %v", approvalID, err)
 		return
 	}
-	log.Printf("[MEETING] #%d dibuat (pending) dari approval #%d conv=%s datetime=%v", mid, approvalID, convID, proposed)
+	log.Printf("[MEETING] #%d dibuat (pending, via=%s) dari approval #%d conv=%s datetime=%v", mid, via, approvalID, convID, proposed)
 
-	// Rekonsiliasi proposal SPAWN agar meeting yang sama tidak terhitung ganda.
-	if det.AttendeeName != "" {
-		if prop, ferr := h.Store.FindPendingSpawnMeeting(ctx, det.AttendeeName, ""); ferr == nil && prop != nil && prop.ID != mid {
-			if uerr := h.Store.UpdateMeetingStatus(ctx, prop.ID, "superseded", "su",
-				fmt.Sprintf("digantikan oleh meeting final #%d (masuk approval gate)", mid)); uerr != nil {
-				log.Printf("[MEETING] pensiun proposal SPAWN #%d gagal: %v", prop.ID, uerr)
-			} else {
-				log.Printf("[MEETING] proposal SPAWN #%d → superseded (digantikan #%d)", prop.ID, mid)
-			}
+	// Rekonsiliasi: pensiunkan proposal SPAWN yang sudah ditemukan agar tak dobel.
+	if spawnProp != nil && spawnProp.ID != mid {
+		if uerr := h.Store.UpdateMeetingStatus(ctx, spawnProp.ID, "superseded", "su",
+			fmt.Sprintf("digantikan oleh meeting final #%d (masuk approval gate)", mid)); uerr != nil {
+			log.Printf("[MEETING] pensiun proposal SPAWN #%d gagal: %v", spawnProp.ID, uerr)
+		} else {
+			log.Printf("[MEETING] proposal SPAWN #%d → superseded (digantikan #%d)", spawnProp.ID, mid)
 		}
 	}
 }
@@ -820,6 +894,7 @@ func firstNonEmptyStr(vals ...string) string {
 // applyActions menjalankan instruksi terstruktur dari agent.
 // srcText adalah pesan asli pemicu turn ini untuk koreksi nomor tujuan.
 func (h *Handler) applyActions(ctx context.Context, convID string, contact *model.Contact, actions []model.Action, execID int64, srcText string) {
+	spawnSeq := 0
 	for _, a := range actions {
 		switch strings.ToUpper(strings.TrimSpace(a.Type)) {
 		case "UPDATE_STATE":
@@ -835,21 +910,14 @@ func (h *Handler) applyActions(ctx context.Context, convID string, contact *mode
 			h.notifyOrchestrator(ctx, convID, contact, a.Payload, execID)
 		case "CONFIRM_MEETING":
 			// SU (lewat orchestrator) menyetujui meeting yang SUDAH ADA & menunggu.
-			// Selesaikan approval yang ada — TIDAK membuat approval/meeting baru.
-			// Sinkron (ctx masih hidup selama applyActions) agar selesai sebelum
-			// balasan orchestrator dikirim ke SU.
 			h.confirmExistingMeeting(ctx, contact, a)
 		case "CONFIRM_VENUE":
 			// Support: Bu Nova sudah memastikan SATU venue. Simpan lokasi pasti ke
-			// meeting offline yang sedang menunggu venue; bila waktu juga sudah
-			// disepakati pihak eksternal, ajukan paket lengkap (waktu+lokasi) ke SU.
-			// Tanpa biaya/estimasi harga. Sinkron (ctx masih hidup di applyActions).
+			// meeting offline yang sedang menunggu venue; 
 			h.confirmVenue(ctx, contact, a)
 		case "RESCHEDULE_MEETING":
 			// SU (lewat orchestrator) ingin menjadwal ulang: TUGASKAN PA Communicator
-			// menegosiasikan waktu baru dengan pihak eksternal lebih dulu (bukan eksekusi
-			// sepihak). Finalisasi (PATCH event + email) terjadi setelah SU menyetujui
-			// jadwal yang disepakati. Goroutine sendiri karena ada inject LLM.
+			// menegosiasikan waktu baru dengan pihak eksternal lebih dulu
 			act := a
 			go h.rescheduleDispatch(contact, act)
 		case "CANCEL_MEETING":
@@ -863,11 +931,10 @@ func (h *Handler) applyActions(ctx context.Context, convID string, contact *mode
 			// mengeksekusi apa pun — hanya meneruskan permintaan ke SU untuk diputuskan.
 			h.requestMeetingChange(ctx, convID, contact, a)
 		case "SPAWN_AGENT":
-			// Inisiasi outbound: SU (via orchestrator) minta agent menghubungi pihak
-			// eksternal. Dijalankan di goroutine sendiri (inject bisa lama) dan
-			// SELALU melewati approval gate sebelum pesan benar-benar terkirim.
+			delay := staggerDelay(spawnSeq, h.SpawnStaggerInterval)
+			spawnSeq++
 			act := a
-			go h.spawnOutbound(contact, act, srcText)
+			go h.spawnOutbound(contact, act, srcText, delay)
 		case "SET_REMINDER":
 			// SU (lewat orchestrator) minta pengingat pada waktu tertentu (sekali atau
 			// berulang harian/mingguan). Disimpan ke scheduled_tasks; worker latar
@@ -908,14 +975,32 @@ func (h *Handler) applyActions(ctx context.Context, convID string, contact *mode
 			h.sendDocument(ctx, convID, contact, a, execID)
 		case "DEFER_TASK":
 			// SU (lewat orchestrator) minta pekerjaan BERAT — riset, penelusuran banyak
-			// sumber, penyusunan laporan — dikerjakan di latar belakang. Giliran sekarang
-			// tetap membalas Pak Sudianto seketika; pekerjaannya dijalankan worker dengan
-			// anggaran waktu jauh lebih besar, lalu hasilnya di-push. Gerbang SU di deferTask.
+			// sumber, penyusunan laporan — dikerjakan di latar belakang. 
 			h.deferTask(ctx, contact, a)
 		case "UPDATE_AGENT_PERSONA":
 			// SU (lewat orchestrator) menyesuaikan GAYA & sebagian perilaku ringan agent.
 			// Disimpan sebagai overlay & disuntik sebagai konteks tiap giliran;
 			h.updateAgentPersona(ctx, contact, a)
+		case "ADMIN_FETCH":
+			// Admin (lewat agent admin) minta tarik data operasional on-demand (read-only):
+			// contacts/executions/usage/approvals/meetings/agents/health.
+			act := a
+			go h.adminFetch(contact, act)
+		case "ADMIN_SPAWN":
+			// Admin (lewat agent admin) men-direktif agent lain (orchestrator/support)
+			// dengan OTORITAS PENUH lewat sesi kontrol terpisah;
+			act := a
+			go h.adminSpawn(contact, act)
+		case "ADMIN_ADD_CONTACT", "ADMIN_SET_TRUST", "ADMIN_DEL_CONTACT":
+			// Admin (lewat agent admin) mengelola whitelist: tambah kontak, ubah trust,
+			// atau hapus (soft-delete).
+			act := a
+			go h.adminManageContact(contact, act)
+		case "ADMIN_RESTART_AGENT":
+			// Admin (lewat agent admin) me-reset sesi OpenClaw agent target yang
+			// mungkin terkontaminasi.
+			act := a
+			go h.adminRestartAgent(contact, act)
 		default:
 			if a.Type != "" {
 				log.Printf("[ACTION] tipe tidak dikenal: %q (diabaikan)", a.Type)
@@ -932,7 +1017,9 @@ func (h *Handler) applyActions(ctx context.Context, convID string, contact *mode
 //   - Agent menyusun pesan pembuka.
 //   - Pesan wajib lewat approval gate SU.
 //   - Jalan di goroutine terpisah karena proses bisa lama.
-func (h *Handler) spawnOutbound(initiator *model.Contact, act model.Action, srcText string) {
+//   - startDelay > 0 menunda seluruh proses (kontak ke-N pada spawn massal) agar
+//     pesan pembuka ke tiap orang tidak terkirim serempak.
+func (h *Handler) spawnOutbound(initiator *model.Contact, act model.Action, srcText string, startDelay time.Duration) {
 	// (1) Keamanan: hanya SU/orchestrator yang boleh memulai kontak keluar.
 	if initiator == nil || initiator.TrustLevel != "su" {
 		trust := "(nil)"
@@ -941,6 +1028,13 @@ func (h *Handler) spawnOutbound(initiator *model.Contact, act model.Action, srcT
 		}
 		log.Printf("[SPAWN] DITOLAK: inisiator non-SU (trust=%s) target=%s", trust, act.Target)
 		return
+	}
+
+	// (1b) Stagger antar-kontak: tunda SEBELUM kerja berat (inject/compose) dan sebelum
+	// membuat ctx ber-timeout, agar timeout 4 menit tidak tergerus jeda ini.
+	if startDelay > 0 {
+		log.Printf("[SPAWN] stagger: menunda %v sebelum menghubungi target=%q", startDelay, firstNonEmptyStr(act.TargetName, act.Target))
+		time.Sleep(startDelay)
 	}
 
 	// (2) Agent tujuan: default pa_communicator; orchestrator tidak boleh di-spawn.

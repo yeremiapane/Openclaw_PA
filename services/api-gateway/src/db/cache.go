@@ -12,7 +12,7 @@ import (
 )
 
 // Cache adalah Layer 2 memory (Redis) untuk percakapan aktif — buffer cepat
-// recent messages + state. TTL 48 jam; sliding window 40 pesan (Fase 7).
+// recent messages + state. TTL 48 jam; sliding window 40 pesan.
 type Cache struct {
 	rdb *redis.Client
 	ttl time.Duration

@@ -44,7 +44,7 @@ func main() {
 	}
 	defer limiter.Close()
 
-	// --- Redis (memory cache, Fase 7) ---
+	// --- Redis (memory cache) ---
 	cache, err := db.NewCache(ctx, cfg)
 	if err != nil {
 		log.Fatalf("gagal koneksi Redis (cache): %v", err)
@@ -59,14 +59,14 @@ func main() {
 	// --- OpenClaw client (shell-out ke CLI `openclaw agent`) ---
 	openClawClient := openclaw.New(cfg.OpenClawBin, cfg.OpenClawNode, cfg.OpenClawScript, cfg.OpenClawAgent, cfg.OpenClawTimeout)
 
-	// --- Service Fase 9 (Calendar + Email via MS Graph, in-process) ---
+	// --- Service (Calendar + Email via MS Graph, in-process) ---
 	// Dipanggil hanya oleh approval gate setelah SU approve. Tak ada port polos.
 	svcClient := services.New(
 		cfg.MSGraphTenantID, cfg.MSGraphClientID, cfg.MSGraphClientSecret,
 		cfg.MSGraphUserUPN, cfg.MSGraphRefreshToken, cfg.MailFromName, cfg.SignaturePath,
 	)
 
-	h := &routes.Handler{Waha: wahaClient, Store: store, OpenClaw: openClawClient, Memory: mem, Services: svcClient, SUPhone: cfg.SUPhone, NovaPhone: cfg.NovaPhone, ReminderLeadMinutes: cfg.ReminderLeadMinutes, AlertEmailTo: cfg.AlertEmailTo, AlertWebhookToken: cfg.AlertWebhookToken, DocWorkDir: cfg.DocWorkDir}
+	h := &routes.Handler{Waha: wahaClient, Store: store, OpenClaw: openClawClient, Memory: mem, Services: svcClient, SUPhone: cfg.SUPhone, NovaPhone: cfg.NovaPhone, AdminPhone: cfg.AdminPhone, ReminderLeadMinutes: cfg.ReminderLeadMinutes, ReadDelayMin: cfg.ReadDelayMin, ReadDelayMax: cfg.ReadDelayMax, SpawnStaggerInterval: cfg.SpawnStaggerInterval, AlertEmailTo: cfg.AlertEmailTo, AlertWebhookToken: cfg.AlertWebhookToken, DocWorkDir: cfg.DocWorkDir}
 	admin := &routes.AdminHandler{Store: store, Gateway: h}
 
 	// --- Worker pengingat: kirim tugas terjadwal ke SU saat jatuh tempo ---
@@ -101,7 +101,7 @@ func main() {
 		})
 	})
 
-	// Security chain Fase 4: auth -> rate limit -> sanitize -> handler.
+	// Security chain : auth -> rate limit -> sanitize -> handler.
 	webhook := r.Group("/webhook")
 	{
 		webhook.POST("/waha",
@@ -140,12 +140,12 @@ func main() {
 
 		adminGrp.GET("/logs", admin.ListLogs)
 
-		// Approval gate (Fase 8)
+		// Approval gate
 		adminGrp.GET("/approvals", admin.ListApprovals)
 		adminGrp.POST("/approvals/:id/approve", admin.ApproveApproval)
 		adminGrp.POST("/approvals/:id/reject", admin.RejectApproval)
 
-		// Observability & evaluasi (Fase 8.5)
+		// Observability & evaluasi 
 		adminGrp.GET("/executions", admin.ListExecutions)
 		adminGrp.GET("/usage", admin.Usage)
 		adminGrp.GET("/outbound", admin.ListOutbound)

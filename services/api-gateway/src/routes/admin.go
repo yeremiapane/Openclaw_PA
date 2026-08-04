@@ -278,7 +278,7 @@ func (h *AdminHandler) ListLogs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"logs": rows, "count": len(rows)})
 }
 
-// ─── Approval gate (Fase 8) ───────────────────────────────────────
+// ─── Approval gate ───────────────────────────────────────
 
 // ListApprovals: GET /admin/approvals?status=pending&limit=50
 func (h *AdminHandler) ListApprovals(c *gin.Context) {

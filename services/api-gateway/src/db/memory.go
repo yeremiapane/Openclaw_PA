@@ -87,7 +87,7 @@ func (s *Store) GetConversationState(ctx context.Context, convID string) (string
 	return state, nil
 }
 
-// UpdateConversationState mengubah state percakapan (dipakai penuh di Fase 8).
+// UpdateConversationState mengubah state percakapan.
 func (s *Store) UpdateConversationState(ctx context.Context, convID, state string) error {
 	_, err := s.pool.Exec(ctx,
 		`UPDATE conversations SET state = $2 WHERE id = $1`, convID, state)

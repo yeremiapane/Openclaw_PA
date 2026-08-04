@@ -1,7 +1,4 @@
-// Webhook penerima notifikasi Alertmanager (Fase M3b).
-// Alertmanager mem-POST alert yang menyala ke sini; gateway merangkumnya menjadi
-// email lalu mengirimkannya via MS Graph ke AlertEmailTo. Endpoint dilindungi
-// Bearer token (ALERT_WEBHOOK_TOKEN); bila token kosong, endpoint dinonaktifkan.
+// Webhook penerima notifikasi Alertmanager.
 package routes
 
 import (

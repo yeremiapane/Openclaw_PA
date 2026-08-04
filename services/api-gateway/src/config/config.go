@@ -25,7 +25,7 @@ type Config struct {
 	OpenClawBin     string        // binary openclaw (default "openclaw" di PATH)
 	OpenClawNode    string        // path node (mode node+script, default "node")
 	OpenClawScript  string        // path openclaw.mjs; kosong → auto-deteksi di Windows
-	OpenClawAgent   string        // agent target (Fase 6: "pa_communicator")
+	OpenClawAgent   string        // agent target ("pa_communicator")
 	OpenClawTimeout time.Duration // batas waktu satu turn agent
 
 	// Database / cache
@@ -48,7 +48,7 @@ type Config struct {
 	// SU & Nova tetap bersumber dari .env (di-seed) apa pun modenya.
 	WhitelistMode string
 
-	// Alerting (Fase M3b): Alertmanager -> webhook gateway -> email via MS Graph.
+	// Alerting : Alertmanager -> webhook gateway -> email via MS Graph.
 	AlertEmailTo      string // tujuan notifikasi alert keamanan/kesehatan
 	AlertWebhookToken string // Bearer token untuk POST /internal/alerts (kosong = endpoint nonaktif)
 
@@ -57,24 +57,34 @@ type Config struct {
 	SULid     string
 	NovaPhone string
 	NovaLid   string
+	AdminPhone string
+	AdminLid   string
 
-	// Pengingat (Fase A): menit sebelum meeting mulai untuk pengingat otomatis.
+	// Pengingat : menit sebelum meeting mulai untuk pengingat otomatis.
 	ReminderLeadMinutes int
+
+	// Jeda "baca" (read receipt / centang biru): sebelum menandai pesan masuk
+	// sudah dibaca, bot menunggu durasi ACAK di rentang [min, max] agar terlihat
+	// manusiawi. Berlaku untuk semua trust (SU, Nova, admin, eksternal).
+	// Set keduanya 0 untuk menonaktifkan jeda (tandai baca seketika).
+	ReadDelayMin time.Duration
+	ReadDelayMax time.Duration
+
+	// Jeda antar-kontak saat SU menyuruh pa_communicator menghubungi BEBERAPA orang
+	// (>=2 SPAWN_AGENT dalam satu instruksi): orang ke-N dihubungi setelah
+	// (N-1) × interval ini, agar tidak mengirim serempak (lebih manusiawi & aman
+	// anti-spam). Kontak pertama tetap seketika. 0 = nonaktif (kirim serempak).
+	SpawnStaggerInterval time.Duration
 
 	// MS Graph (Calendar + Email) in-process, dipanggil saat approve.
 	MSGraphTenantID     string
 	MSGraphClientID     string
 	MSGraphClientSecret string
 	MSGraphUserUPN      string // pengirim email & pemilik calendar
-	// MSGraphRefreshToken = refresh token DELEGATED (opsional) untuk membaca email
-	// (Email Watch). Dipakai sebagai FALLBACK bila izin aplikasi (Mail.Read app) belum
-	// ada / ditolak. Kosong = hanya andalkan izin aplikasi.
 	MSGraphRefreshToken string
 	MailFromName        string // nama tampilan pengirim
 	SignaturePath       string // path signature.html untuk email
 
-	// DocWorkDir = direktori kerja untuk SEND_DOCUMENT `docPath`.
-	// Path di luar direktori ini ditolak.
 	DocWorkDir string
 }
 
@@ -129,12 +139,19 @@ func Load() Config {
 		AlertEmailTo:      getenv("ALERT_EMAIL_TO", "yeremia.yosefan@hypernet.co.id"),
 		AlertWebhookToken: getenv("ALERT_WEBHOOK_TOKEN", ""),
 
-		SUPhone:   getenv("SU_PHONE", ""),
-		SULid:     getenv("SU_LID", ""),
-		NovaPhone: getenv("NOVA_PHONE", ""),
-		NovaLid:   getenv("NOVA_LID", ""),
+		SUPhone:    getenv("SU_PHONE", ""),
+		SULid:      getenv("SU_LID", ""),
+		NovaPhone:  getenv("NOVA_PHONE", ""),
+		NovaLid:    getenv("NOVA_LID", ""),
+		AdminPhone: getenv("ADMIN_PHONE", ""),
+		AdminLid:   getenv("ADMIN_LID", ""),
 
 		ReminderLeadMinutes: getenvInt("MEETING_REMINDER_LEAD_MIN", 15),
+
+		ReadDelayMin: time.Duration(getenvInt("READ_DELAY_MIN_SEC", 1)) * time.Second,
+		ReadDelayMax: time.Duration(getenvInt("READ_DELAY_MAX_SEC", 30)) * time.Second,
+
+		SpawnStaggerInterval: time.Duration(getenvInt("SPAWN_STAGGER_SEC", 60)) * time.Second,
 
 		MSGraphTenantID:     getenv("MS_GRAPH_TENANT_ID", ""),
 		MSGraphClientID:     getenv("MS_GRAPH_CLIENT_ID", ""),
@@ -165,6 +182,36 @@ func Load() Config {
 	if cfg.MSGraphTenantID == "" || cfg.MSGraphClientID == "" || cfg.MSGraphClientSecret == "" || cfg.MSGraphUserUPN == "" {
 		log.Println("[config] PERINGATAN: kredensial MS Graph belum lengkap — penjadwalan meeting (Calendar/Email) nonaktif")
 	}
+	if cfg.AdminPhone == "" {
+		log.Println("[config] ADMIN_PHONE kosong — agent admin nonaktif (tak ada nomor yang dipetakan ke trust 'admin').")
+	} else {
+		log.Printf("[config] ADMIN_PHONE di-set — agent admin aktif untuk nomor %s (trust=admin).", cfg.AdminPhone)
+	}
+	// Normalisasi jeda baca: negatif → 0; bila min > max, tukar agar rentang valid.
+	if cfg.ReadDelayMin < 0 {
+		cfg.ReadDelayMin = 0
+	}
+	if cfg.ReadDelayMax < 0 {
+		cfg.ReadDelayMax = 0
+	}
+	if cfg.ReadDelayMin > cfg.ReadDelayMax {
+		cfg.ReadDelayMin, cfg.ReadDelayMax = cfg.ReadDelayMax, cfg.ReadDelayMin
+	}
+	if cfg.ReadDelayMax == 0 {
+		log.Println("[config] READ_DELAY: nonaktif — pesan masuk ditandai dibaca seketika.")
+	} else {
+		log.Printf("[config] READ_DELAY: pesan masuk ditandai dibaca setelah jeda acak %v–%v.",
+			cfg.ReadDelayMin, cfg.ReadDelayMax)
+	}
+	if cfg.SpawnStaggerInterval < 0 {
+		cfg.SpawnStaggerInterval = 0
+	}
+	if cfg.SpawnStaggerInterval == 0 {
+		log.Println("[config] SPAWN_STAGGER: nonaktif — kontak keluar massal dikirim serempak.")
+	} else {
+		log.Printf("[config] SPAWN_STAGGER: kontak keluar ke-2 dst. ditunda kelipatan %v.", cfg.SpawnStaggerInterval)
+	}
+
 	if cfg.WhitelistMode == "open" {
 		log.Println("[config] WHITELIST_MODE=open — SEMUA nomor tak dikenal akan otomatis di-whitelist & dilayani pa_communicator (kecuali yang diblokir admin).")
 	} else {

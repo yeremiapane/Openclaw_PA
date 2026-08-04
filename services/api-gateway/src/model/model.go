@@ -305,7 +305,7 @@ type ExternalContact struct {
 	DeletedAt    *time.Time      `json:"deleted_at,omitempty"`
 }
 
-// Message = satu pesan dalam sebuah percakapan (Fase 7).
+// Message = satu pesan dalam sebuah percakapan.
 // Role bernilai "user" (dari kontak) atau "assistant" (balasan agent).
 type Message struct {
 	Role      string    `json:"role"`
@@ -401,15 +401,16 @@ type Action struct {
 	DocContent  string `json:"docContent,omitempty"`
 	DocCaption  string `json:"docCaption,omitempty"`
 	DocPath     string `json:"docPath,omitempty"`
-	// UPDATE_AGENT_PERSONA (orchestrator/SU): Mengubah preferensi gaya ringan agent
-	// (nada, sapaan, formalitas, emoji, panjang jawaban, bahasa, dll.). Agent kirim
-	// PersonaText sebagai overlay penuh (mengganti overlay lama). Gateway menyimpan
-	// overlay sebagai konteks per giliran; aturan inti (SOUL.md), approval, dan keamanan
-	// tetap berlaku.
-	//   PersonaText = teks overlay (kosong = hapus preferensi kustom).
-	//   TargetAgent = agent tujuan (kosong → "orchestrator"; saat ini hanya itu).
+	// UPDATE_AGENT_PERSONA (orchestrator/SU): Ubah preferensi gaya ringan agent.
+	// PersonaText = overlay penuh (kosong = hapus preferensi kustom).
+	// TargetAgent = agent tujuan (kosong -> "orchestrator").
 	PersonaText string `json:"personaText,omitempty"`
 	TargetAgent string `json:"targetAgent,omitempty"`
+
+	Resource string `json:"resource,omitempty"`
+	Limit    int    `json:"limit,omitempty"`
+
+	Trust string `json:"trust,omitempty"`
 }
 
 // Approval = satu pesan keluar yang ditahan menunggu persetujuan Pak Sudianto
@@ -466,7 +467,6 @@ type Execution struct {
 }
 
 // OutboundMessage = satu pesan yang benar-benar dikirim bot.
-// Berbeda dari Message (memori konteks): ini jejak pengiriman aktual.
 type OutboundMessage struct {
 	ID             int64     `json:"id"`
 	ExecutionID    *int64    `json:"execution_id,omitempty"`
@@ -483,7 +483,6 @@ type OutboundMessage struct {
 }
 
 // MeetingRequest = request meeting + status lifecycle.
-// Dibuat otomatis saat approval gate menahan pesan; status mengikuti keputusan SU.
 type MeetingRequest struct {
 	ID               int64           `json:"id"`
 	ConversationID   string          `json:"conversation_id,omitempty"`
@@ -507,8 +506,6 @@ type MeetingRequest struct {
 }
 
 // ScheduledTask = tugas pengingat terjadwal yang dijalankan saat FireAt tercapai.
-// Kind: "reminder" | "meeting_reminder". Status: pending | fired | cancelled | error.
-// Pengingat berulang akan dijadwalkan ulang setelah task fire.
 type ScheduledTask struct {
 	ID        int64      `json:"id"`
 	FireAt    time.Time  `json:"fire_at"`
@@ -526,9 +523,7 @@ type ScheduledTask struct {
 	FiredAt   *time.Time `json:"fired_at,omitempty"`
 }
 
-// EmailWatch = permintaan pemantauan email. Agent melaporkan email yang cocok
-// dengan Criteria. FromFilter/KeywordFilter = pra-saring opsional. LastSeenAt
-// adalah batas bawah waktu untuk evaluasi (maju tiap ronde). Status: active|cancelled|expired.
+// EmailWatch = permintaan pemantauan email.
 type EmailWatch struct {
 	ID            int64      `json:"id"`
 	Criteria      string     `json:"criteria"`

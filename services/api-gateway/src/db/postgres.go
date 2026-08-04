@@ -65,7 +65,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_identifier ON access_logs (identifier);
 CREATE INDEX IF NOT EXISTS idx_logs_decision   ON access_logs (decision);
 CREATE INDEX IF NOT EXISTS idx_logs_created     ON access_logs (created_at DESC);
 
--- ── Fase 4.7: profiling + soft-delete + jejak waktu (cermin sql/003_*.sql) ──
+-- ── profiling + soft-delete + jejak waktu (cermin sql/003_*.sql) ──
 ALTER TABLE contacts ADD COLUMN IF NOT EXISTS address    TEXT;
 ALTER TABLE contacts ADD COLUMN IF NOT EXISTS tags       TEXT[]      NOT NULL DEFAULT '{}';
 ALTER TABLE contacts ADD COLUMN IF NOT EXISTS profile    JSONB       NOT NULL DEFAULT '{}'::jsonb;
@@ -104,7 +104,7 @@ CREATE TRIGGER trg_external_updated BEFORE UPDATE ON external_contacts
 
 CREATE INDEX IF NOT EXISTS idx_external_risk ON external_contacts (risk_score DESC);
 
--- ── Fase 7: memory layer (conversations + messages + contact_facts) ──
+-- ── memory layer (conversations + messages + contact_facts) ──
 CREATE TABLE IF NOT EXISTS conversations (
     id          VARCHAR(96)  PRIMARY KEY,                       -- {agent}:{phone}
     contact_id  INTEGER      REFERENCES contacts(id) ON DELETE SET NULL,
@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS contact_facts (
 );
 CREATE INDEX IF NOT EXISTS idx_facts_contact ON contact_facts (contact_id);
 
--- ── Fase 8: approval gate (pesan keluar ditahan menunggu persetujuan SU) ──
+-- ── approval gate (pesan keluar ditahan menunggu persetujuan SU) ──
 CREATE TABLE IF NOT EXISTS approval_pending (
     id              BIGSERIAL    PRIMARY KEY,
     conversation_id VARCHAR(96)  NOT NULL,
@@ -199,8 +199,7 @@ CREATE INDEX IF NOT EXISTS idx_exec_agent   ON agent_executions (agent_id);
 CREATE INDEX IF NOT EXISTS idx_exec_created ON agent_executions (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_exec_model   ON agent_executions (model);
 
--- Setiap pesan yang BENAR-BENAR dikirim bot (berbeda dari tabel messages = memori).
--- Untuk trace "bot mengirim apa, ke siapa, dipicu eksekusi mana".
+-- Untuk trace chat agent
 CREATE TABLE IF NOT EXISTS outbound_messages (
     id              BIGSERIAL    PRIMARY KEY,
     execution_id    BIGINT       REFERENCES agent_executions(id) ON DELETE SET NULL,
@@ -265,7 +264,6 @@ CREATE TABLE IF NOT EXISTS meeting_status_history (
 CREATE INDEX IF NOT EXISTS idx_msh_meeting ON meeting_status_history (meeting_id, created_at);
 
 -- Tugas terjadwal (pengingat). Worker latar belakang memproses baris 'pending'
--- yang fire_at-nya sudah lewat: orchestrator menyusun & mengirim pesan ke SU.
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
     id          BIGSERIAL    PRIMARY KEY,
     fire_at     TIMESTAMPTZ  NOT NULL,
@@ -291,19 +289,14 @@ CREATE INDEX IF NOT EXISTS idx_sched_due     ON scheduled_tasks (status, fire_at
 CREATE INDEX IF NOT EXISTS idx_sched_meeting ON scheduled_tasks (meeting_id);
 
 -- agent_preferences: overlay GAYA & SEBAGIAN PERILAKU per-agent yang disetel Pak Sudianto.
--- Disuntik sebagai KONTEKS tiap giliran; TIDAK menimpa SOUL.md inti (approval/keamanan/
--- output-contract tetap otoritatif). Satu baris per agent (saat ini hanya "orchestrator").
 CREATE TABLE IF NOT EXISTS agent_preferences (
     agent      VARCHAR(32)  PRIMARY KEY,
     prefs      TEXT         NOT NULL DEFAULT '',
     updated_at TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
--- Pemantauan email (Email Watch): SU minta agent MELAPOR proaktif bila ada email masuk
--- yang cocok dengan kriteria bahasa alami (mis. "follow up dari Yere"). Worker latar
--- belakang menarik inbox berkala, pra-saring murah (from_filter/keyword_filter), lalu
--- orchestrator menilai kecocokan & melapor ke SU. last_seen_at = batas bawah waktu email
--- yang dievaluasi (maju tiap ronde agar tiap email dinilai tepat sekali).
+-- Pemantauan email (Email Watch): agent melapor proaktif untuk email yang cocok kriteria.
+-- Worker cek inbox berkala
 CREATE TABLE IF NOT EXISTS email_watches (
     id              BIGSERIAL    PRIMARY KEY,
     criteria        TEXT         NOT NULL,                  -- kriteria bahasa alami
@@ -373,18 +366,19 @@ func (s *Store) SeedTrustedContacts(ctx context.Context, cfg config.Config) erro
 	if err := s.upsertContact(ctx, cfg.NovaPhone, cfg.NovaLid, "Bu Nova", "semi_trusted"); err != nil {
 		return err
 	}
-	log.Printf("[db] seed kontak trusted selesai (SU=%s lid=%s, Nova=%s lid=%s)",
-		cfg.SUPhone, cfg.SULid, cfg.NovaPhone, cfg.NovaLid)
+	if err := s.upsertContact(ctx, cfg.AdminPhone, cfg.AdminLid, "Admin", "admin"); err != nil {
+		return err
+	}
+	log.Printf("[db] seed kontak trusted selesai (SU=%s lid=%s, Nova=%s lid=%s, Admin=%s lid=%s)",
+		cfg.SUPhone, cfg.SULid, cfg.NovaPhone, cfg.NovaLid, cfg.AdminPhone, cfg.AdminLid)
 	return nil
 }
 
 // ErrNotWhitelisted dikembalikan bila kontak tidak ada di whitelist.
 var ErrNotWhitelisted = errors.New("kontak tidak ada di whitelist")
 
-// EnsureContact ambil kontak whitelist by phone; jika belum ada, buat dengan
-// trust 'external' (balasan dirutekan ke pa_communicator). Digunakan saat SU
-// menginisiasi kontak baru (SPAWN_AGENT) supaya balasan lolos security dan punya
-// konteks.
+// EnsureContact ambil kontak whitelist via phone; jika belum ada, buat
+// sebagai trust 'external' agar balasan (SPAWN_AGENT) tetap lolos security.
 func (s *Store) EnsureContact(ctx context.Context, phone, name, company, email string) (*model.Contact, error) {
 	c, err := s.FindContact(ctx, model.Identifier{Kind: "phone", Value: phone})
 	if err == nil {

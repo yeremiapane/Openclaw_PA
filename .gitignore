@@ -1,6 +1,5 @@
 # ─── Rahasia ────────────────────────────────────────────────
 # .env berisi kredensial asli
-# var yang dibutuhkan — lihat services/api-gateway/src/config/config.go.
 .env
 .env.*
 !.env.example
@@ -11,18 +10,14 @@
 # Kredensial O365/Google
 /credentials/
 
-# ─── Data & state runtime (jangan di-commit) ────────────────
-# /data/  = volume container: data/postgres (DB) & data/openclaw (state brain).
-# /.waha/ = session WhatsApp.
-# /.openclaw/ = state OpenClaw lokal / hasil ekstrak dump migrasi. Memuat RAHASIA
-#   (openclaw.json → gateway.auth.token)
+# ─── Data & state runtime ────────────────
 /data/
 /.waha/
 /.waha.noweb.bak
 /.openclaw/
 openclaw-dump.tar.gz
 
-# QR code WAHA = artefak login, jangan di-commit
+# QR code WAHA = artefak login
 waha_qr.png
 
 # ─── Go ─────────────────────────────────────────────────────
@@ -44,3 +39,5 @@ log.txt
 
 *.png
 *.ps1
+
+*_test.go

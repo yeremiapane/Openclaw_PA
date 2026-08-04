@@ -1,4 +1,4 @@
-// Fase 8.5 — observability & evaluasi.
+// observability & evaluasi.
 // Operasi pada tabel agent_executions, outbound_messages, meeting_requests,
 // dan meeting_status_history untuk trace token usage, pesan keluar, serta
 // siklus hidup request meeting.

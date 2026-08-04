@@ -2400,10 +2400,10 @@ func (h *Handler) notifySUTimeApproval(ctx context.Context, m *model.MeetingRequ
 			when = formatWIBLong(oldAt) + " → " + when
 		}
 	}
-	body := fmt.Sprintf("%s (#%d)\n"+
+	body := fmt.Sprintf("%s\n"+
 		"Dengan: %s\n🗓️ %s\nTopik: %s\n\n"+
-		"%s\n\nBalas *SETUJU %d* untuk menyetujui waktu, atau *TOLAK %d* untuk batal.",
-		header, apID, who, when, title, coordNote, apID, apID)
+		"%s\n\nBalas *SETUJU* untuk menyetujui waktu, atau *TOLAK* untuk batal.",
+		header, who, when, title, coordNote)
 	ap := apID
 	h.sendAndRecord(ctx, func() error { return h.Waha.SendText(h.SUPhone, body) },
 		model.OutboundMessage{
@@ -2458,9 +2458,9 @@ func (h *Handler) notifyDuplicateMeeting(ctx context.Context, dup *model.Meeting
 	case "pending":
 		if dup.ApprovalID != nil {
 			msg = fmt.Sprintf("Meeting dengan %s%s sudah tercatat dan menunggu konfirmasi Anda. "+
-				"Balas *SETUJU %d* untuk mengonfirmasi, atau *TOLAK %d* untuk membatalkan. "+
+				"Balas *SETUJU* untuk mengonfirmasi, atau *TOLAK* untuk membatalkan. "+
 				"(Saya tidak membuat permintaan baru agar tidak terjadi jadwal ganda.)",
-				who, when, *dup.ApprovalID, *dup.ApprovalID)
+				who, when)
 		} else {
 			msg = fmt.Sprintf("Meeting dengan %s%s sudah tercatat dan masih dalam proses. "+
 				"Saya tidak membuat permintaan baru agar tidak terjadi jadwal ganda.", who, when)
@@ -2598,8 +2598,8 @@ func (h *Handler) notifySUApproval(ctx context.Context, convID string, id int64,
 		}
 	}
 
-	msg := fmt.Sprintf("%s (#%d)\n%s%s\nBalas *SETUJU %d* untuk konfirmasi, atau *TOLAK %d* untuk batal.",
-		header, id, body, slotNote, id, id)
+	msg := fmt.Sprintf("%s \n%s%s\nBalas *SETUJU* untuk konfirmasi, atau *TOLAK* untuk batal.",
+		header, body, slotNote)
 	apID := id
 	h.sendAndRecord(ctx, func() error { return h.Waha.SendText(h.SUPhone, msg) },
 		model.OutboundMessage{

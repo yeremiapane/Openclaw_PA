@@ -48,6 +48,17 @@ type Handler struct {
 	ReadDelayMin time.Duration
 	ReadDelayMax time.Duration
 
+	// PresenceDelayMin/Max = jeda ACAK antara centang biru dan indikator "mengetik…".
+	// Max<=0 = seketika.
+	PresenceDelayMin time.Duration
+	PresenceDelayMax time.Duration
+
+	// LongReplyDelayMin/Max = jeda ACAK sebelum mengirim balasan panjang (>= LongReplyThreshold
+	// karakter); indikator "mengetik…" tetap tampil selama jeda. Max<=0 = nonaktif.
+	LongReplyDelayMin  time.Duration
+	LongReplyDelayMax  time.Duration
+	LongReplyThreshold int
+
 	// BurstWindow = jendela debounce penggabungan pesan beruntun + serialisasi per-chat.
 	// Model: hanya SATU giliran berjalan per chat. Pesan yang datang berdekatan (dalam
 	// BurstWindow) ATAU selagi giliran sebelumnya masih diproses (mis. agen ~2 menit)
@@ -169,7 +180,7 @@ func (h *Handler) WahaInbound(c *gin.Context) {
 	go func(chatID, msgID string, skip bool) {
 		defer close(readDone)
 		if !skip {
-			if d := randReadDelay(h.ReadDelayMin, h.ReadDelayMax); d > 0 {
+			if d := randDelay(h.ReadDelayMin, h.ReadDelayMax); d > 0 {
 				time.Sleep(d)
 			}
 		}
@@ -342,6 +353,19 @@ func (h *Handler) process(contact *model.Contact, agentID, convID, from, text, r
 	case <-readDone:
 	case <-ctx.Done():
 	}
+	// Jeda "mengetik" manusiawi untuk balasan PANJANG: bila balasan >= ambang karakter,
+	// tahan sesaat (acak) sambil indikator "mengetik…" tetap tampil, meniru waktu yang
+	// dibutuhkan manusia mengetik pesan panjang. Balasan pendek dikirim tanpa jeda.
+	if h.LongReplyThreshold >= 0 && len([]rune(reply.Response)) >= h.LongReplyThreshold {
+		if d := randDelay(h.LongReplyDelayMin, h.LongReplyDelayMax); d > 0 {
+			log.Printf("[PRESENCE] balasan panjang (%d char) — jeda mengetik %v sebelum kirim (chat=%s)",
+				len([]rune(reply.Response)), d, from)
+			select {
+			case <-time.After(d):
+			case <-ctx.Done():
+			}
+		}
+	}
 	stopTyping() // hentikan indikator "mengetik…" tepat sebelum balasan terkirim
 	h.sendAndRecord(ctx, func() error { return h.Waha.SendToChatQuoted(from, reply.Response, quoteID) },
 		model.OutboundMessage{
@@ -364,6 +388,15 @@ func (h *Handler) typingKeepAlive(ctx context.Context, chatID string, readDone <
 	// dikirim / sesi selesai).
 	h.markEngaged(chatID)
 	defer h.unmarkEngaged(chatID)
+	// Jeda manusiawi antara "centang biru" dan indikator "mengetik…": manusia butuh
+	// sesaat untuk beralih dari membaca ke mengetik. Dibatalkan bila ctx selesai.
+	if d := randDelay(h.PresenceDelayMin, h.PresenceDelayMax); d > 0 {
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			return
+		}
+	}
 	if err := h.Waha.StartTyping(chatID); err != nil {
 		log.Printf("[PRESENCE] startTyping %s gagal: %v", chatID, err)
 	}
@@ -877,10 +910,11 @@ func (h *Handler) reserveSpawnSlot(interval time.Duration) time.Duration {
 	return delay
 }
 
-// randReadDelay mengembalikan durasi acak di rentang [min, max] (inklusif) untuk
-// menunda penandaan "sudah dibaca". Bila max<=0 atau max<min→0 (tanpa jeda). Bila
-// min==max, kembalikan tepat nilai itu. Memakai rand global (auto-seeded, Go 1.20+).
-func randReadDelay(min, max time.Duration) time.Duration {
+// randDelay mengembalikan durasi acak di rentang [min, max] (inklusif). Dipakai untuk
+// semua jeda "manusiawi" (baca, presence, balasan panjang). Bila max<=0 atau max<min→0
+// (tanpa jeda). Bila min==max, kembalikan tepat nilai itu. Memakai rand global
+// (auto-seeded, Go 1.20+).
+func randDelay(min, max time.Duration) time.Duration {
 	if max <= 0 || max < min {
 		return 0
 	}

@@ -73,7 +73,7 @@ func main() {
 		googleClient = google.New(cfg.GoogleClientID, cfg.GoogleClientSecret, cfg.GoogleRefreshToken)
 	}
 
-	h := &routes.Handler{Waha: wahaClient, Store: store, OpenClaw: openClawClient, Memory: mem, Services: svcClient, SUPhone: cfg.SUPhone, NovaPhone: cfg.NovaPhone, AdminPhone: cfg.AdminPhone, ReminderLeadMinutes: cfg.ReminderLeadMinutes, ReadDelayMin: cfg.ReadDelayMin, ReadDelayMax: cfg.ReadDelayMax, BurstWindow: cfg.BurstWindow, SpawnStaggerInterval: cfg.SpawnStaggerInterval, PreflightCheckNumber: cfg.PreflightCheckNumber, Google: googleClient, GoogleContactSyncDelay: cfg.GoogleContactSyncDelay, AlertEmailTo: cfg.AlertEmailTo, AlertWebhookToken: cfg.AlertWebhookToken, DocWorkDir: cfg.DocWorkDir}
+	h := &routes.Handler{Waha: wahaClient, Store: store, OpenClaw: openClawClient, Memory: mem, Services: svcClient, SUPhone: cfg.SUPhone, NovaPhone: cfg.NovaPhone, AdminPhone: cfg.AdminPhone, ReminderLeadMinutes: cfg.ReminderLeadMinutes, ReadDelayMin: cfg.ReadDelayMin, ReadDelayMax: cfg.ReadDelayMax, PresenceDelayMin: cfg.PresenceDelayMin, PresenceDelayMax: cfg.PresenceDelayMax, LongReplyDelayMin: cfg.LongReplyDelayMin, LongReplyDelayMax: cfg.LongReplyDelayMax, LongReplyThreshold: cfg.LongReplyThreshold, BurstWindow: cfg.BurstWindow, SpawnStaggerInterval: cfg.SpawnStaggerInterval, PreflightCheckNumber: cfg.PreflightCheckNumber, Google: googleClient, GoogleContactSyncDelay: cfg.GoogleContactSyncDelay, AlertEmailTo: cfg.AlertEmailTo, AlertWebhookToken: cfg.AlertWebhookToken, DocWorkDir: cfg.DocWorkDir}
 	admin := &routes.AdminHandler{Store: store, Gateway: h}
 
 	// --- Worker pengingat: kirim tugas terjadwal ke SU saat jatuh tempo ---

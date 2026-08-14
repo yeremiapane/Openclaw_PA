@@ -66,6 +66,19 @@ type Config struct {
 	ReadDelayMin time.Duration
 	ReadDelayMax time.Duration
 
+	// PresenceDelayMin/Max = rentang jeda ACAK antara "centang biru" (tandai dibaca)
+	// dan munculnya indikator "mengetik…", agar transisi terasa manusiawi. Max<=0 = seketika.
+	PresenceDelayMin time.Duration
+	PresenceDelayMax time.Duration
+
+	// LongReplyDelayMin/Max = rentang jeda ACAK sebelum mengirim balasan yang PANJANG
+	// (>= LongReplyThreshold karakter), mensimulasikan waktu mengetik manusia. Selama
+	// jeda ini indikator "mengetik…" tetap tampil. Max<=0 = nonaktif.
+	LongReplyDelayMin time.Duration
+	LongReplyDelayMax time.Duration
+	// LongReplyThreshold = ambang jumlah karakter balasan agar jeda panjang berlaku.
+	LongReplyThreshold int
+
 	BurstWindow time.Duration
 
 	SpawnStaggerInterval time.Duration
@@ -153,6 +166,13 @@ func Load() Config {
 		ReadDelayMin: time.Duration(getenvInt("READ_DELAY_MIN_SEC", 1)) * time.Second,
 		ReadDelayMax: time.Duration(getenvInt("READ_DELAY_MAX_SEC", 30)) * time.Second,
 
+		PresenceDelayMin: time.Duration(getenvInt("PRESENCE_DELAY_MIN_MS", 1000)) * time.Millisecond,
+		PresenceDelayMax: time.Duration(getenvInt("PRESENCE_DELAY_MAX_MS", 2000)) * time.Millisecond,
+
+		LongReplyDelayMin:  time.Duration(getenvInt("LONG_REPLY_DELAY_MIN_MS", 1000)) * time.Millisecond,
+		LongReplyDelayMax:  time.Duration(getenvInt("LONG_REPLY_DELAY_MAX_MS", 3000)) * time.Millisecond,
+		LongReplyThreshold: getenvInt("LONG_REPLY_THRESHOLD_CHARS", 200),
+
 		BurstWindow: time.Duration(getenvInt("BURST_WINDOW_MS", 6000)) * time.Millisecond,
 
 		SpawnStaggerInterval: time.Duration(getenvInt("SPAWN_STAGGER_SEC", 60)) * time.Second,
@@ -214,6 +234,41 @@ func Load() Config {
 	} else {
 		log.Printf("[config] READ_DELAY: pesan masuk ditandai dibaca setelah jeda acak %v–%v.",
 			cfg.ReadDelayMin, cfg.ReadDelayMax)
+	}
+	// Normalisasi jeda presence (baca→mengetik): negatif → 0; tukar bila min > max.
+	if cfg.PresenceDelayMin < 0 {
+		cfg.PresenceDelayMin = 0
+	}
+	if cfg.PresenceDelayMax < 0 {
+		cfg.PresenceDelayMax = 0
+	}
+	if cfg.PresenceDelayMin > cfg.PresenceDelayMax {
+		cfg.PresenceDelayMin, cfg.PresenceDelayMax = cfg.PresenceDelayMax, cfg.PresenceDelayMin
+	}
+	if cfg.PresenceDelayMax == 0 {
+		log.Println("[config] PRESENCE_DELAY: nonaktif — indikator mengetik muncul seketika setelah centang biru.")
+	} else {
+		log.Printf("[config] PRESENCE_DELAY: jeda acak %v–%v antara centang biru dan indikator mengetik.",
+			cfg.PresenceDelayMin, cfg.PresenceDelayMax)
+	}
+	// Normalisasi jeda balasan panjang: negatif → 0; tukar bila min > max.
+	if cfg.LongReplyDelayMin < 0 {
+		cfg.LongReplyDelayMin = 0
+	}
+	if cfg.LongReplyDelayMax < 0 {
+		cfg.LongReplyDelayMax = 0
+	}
+	if cfg.LongReplyDelayMin > cfg.LongReplyDelayMax {
+		cfg.LongReplyDelayMin, cfg.LongReplyDelayMax = cfg.LongReplyDelayMax, cfg.LongReplyDelayMin
+	}
+	if cfg.LongReplyThreshold < 0 {
+		cfg.LongReplyThreshold = 0
+	}
+	if cfg.LongReplyDelayMax == 0 {
+		log.Println("[config] LONG_REPLY_DELAY: nonaktif — balasan panjang dikirim tanpa jeda tambahan.")
+	} else {
+		log.Printf("[config] LONG_REPLY_DELAY: balasan >= %d karakter ditunda acak %v–%v sebelum dikirim (mengetik tetap tampil).",
+			cfg.LongReplyThreshold, cfg.LongReplyDelayMin, cfg.LongReplyDelayMax)
 	}
 	if cfg.BurstWindow < 0 {
 		cfg.BurstWindow = 0

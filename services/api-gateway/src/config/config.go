@@ -63,18 +63,20 @@ type Config struct {
 	// Pengingat : menit sebelum meeting mulai untuk pengingat otomatis.
 	ReminderLeadMinutes int
 
-	// Jeda "baca" (read receipt / centang biru): sebelum menandai pesan masuk
-	// sudah dibaca, bot menunggu durasi ACAK di rentang [min, max] agar terlihat
-	// manusiawi. Berlaku untuk semua trust (SU, Nova, admin, eksternal).
-	// Set keduanya 0 untuk menonaktifkan jeda (tandai baca seketika).
 	ReadDelayMin time.Duration
 	ReadDelayMax time.Duration
 
-	// Jeda antar-kontak saat SU menyuruh pa_communicator menghubungi BEBERAPA orang
-	// (>=2 SPAWN_AGENT dalam satu instruksi): orang ke-N dihubungi setelah
-	// (N-1) × interval ini, agar tidak mengirim serempak (lebih manusiawi & aman
-	// anti-spam). Kontak pertama tetap seketika. 0 = nonaktif (kirim serempak).
+	BurstWindow time.Duration
+
 	SpawnStaggerInterval time.Duration
+
+	PreflightCheckNumber bool
+
+	GoogleContactsEnabled  bool
+	GoogleClientID         string
+	GoogleClientSecret     string
+	GoogleRefreshToken     string
+	GoogleContactSyncDelay time.Duration 
 
 	// MS Graph (Calendar + Email) in-process, dipanggil saat approve.
 	MSGraphTenantID     string
@@ -151,7 +153,17 @@ func Load() Config {
 		ReadDelayMin: time.Duration(getenvInt("READ_DELAY_MIN_SEC", 1)) * time.Second,
 		ReadDelayMax: time.Duration(getenvInt("READ_DELAY_MAX_SEC", 30)) * time.Second,
 
+		BurstWindow: time.Duration(getenvInt("BURST_WINDOW_MS", 6000)) * time.Millisecond,
+
 		SpawnStaggerInterval: time.Duration(getenvInt("SPAWN_STAGGER_SEC", 60)) * time.Second,
+
+		PreflightCheckNumber: getenvBool("PREFLIGHT_CHECK_NUMBER", true),
+
+		GoogleContactsEnabled:  getenvBool("GOOGLE_CONTACTS_ENABLED", false),
+		GoogleClientID:         getenv("GOOGLE_CLIENT_ID", ""),
+		GoogleClientSecret:     getenv("GOOGLE_CLIENT_SECRET", ""),
+		GoogleRefreshToken:     getenv("GOOGLE_REFRESH_TOKEN", ""),
+		GoogleContactSyncDelay: time.Duration(getenvInt("GOOGLE_CONTACT_SYNC_DELAY_SEC", 90)) * time.Second,
 
 		MSGraphTenantID:     getenv("MS_GRAPH_TENANT_ID", ""),
 		MSGraphClientID:     getenv("MS_GRAPH_CLIENT_ID", ""),
@@ -203,6 +215,15 @@ func Load() Config {
 		log.Printf("[config] READ_DELAY: pesan masuk ditandai dibaca setelah jeda acak %v–%v.",
 			cfg.ReadDelayMin, cfg.ReadDelayMax)
 	}
+	if cfg.BurstWindow < 0 {
+		cfg.BurstWindow = 0
+	}
+	if cfg.BurstWindow == 0 {
+		log.Println("[config] BURST_WINDOW: nonaktif — tiap pesan diproses & dibalas sendiri.")
+	} else {
+		log.Printf("[config] BURST_WINDOW: pesan beruntun digabung dalam jendela %v lalu dibalas sekali (kutip pesan terakhir).",
+			cfg.BurstWindow)
+	}
 	if cfg.SpawnStaggerInterval < 0 {
 		cfg.SpawnStaggerInterval = 0
 	}
@@ -210,6 +231,24 @@ func Load() Config {
 		log.Println("[config] SPAWN_STAGGER: nonaktif — kontak keluar massal dikirim serempak.")
 	} else {
 		log.Printf("[config] SPAWN_STAGGER: kontak keluar ke-2 dst. ditunda kelipatan %v.", cfg.SpawnStaggerInterval)
+	}
+	if cfg.PreflightCheckNumber {
+		log.Println("[config] PREFLIGHT_CHECK_NUMBER: aktif — nomor tujuan baru dicek terdaftar di WhatsApp sebelum dichat")
+	} else {
+		log.Println("[config] PREFLIGHT_CHECK_NUMBER: nonaktif — kontak keluar dikirim tanpa cek nomor lebih dulu.")
+	}
+	if cfg.GoogleContactSyncDelay < 0 {
+		cfg.GoogleContactSyncDelay = 0
+	}
+	googleCredsOK := cfg.GoogleClientID != "" && cfg.GoogleClientSecret != "" && cfg.GoogleRefreshToken != ""
+	if cfg.GoogleContactsEnabled && !googleCredsOK {
+		log.Println("[config] PERINGATAN: GOOGLE_CONTACTS_ENABLED=true")
+		cfg.GoogleContactsEnabled = false
+	}
+	if cfg.GoogleContactsEnabled {
+		log.Printf("[config] GOOGLE_CONTACTS: aktif — nomor baru disimpan ke Google People API lalu tunggu sinkron %v sebelum dihubungi.", cfg.GoogleContactSyncDelay)
+	} else {
+		log.Println("[config] GOOGLE_CONTACTS: nonaktif — tidak menyimpan kontak ke Google sebelum menghubungi.")
 	}
 
 	if cfg.WhitelistMode == "open" {
@@ -237,6 +276,19 @@ func normalizeWhitelistMode(v string) string {
 func getenv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func getenvBool(key string, fallback bool) bool {
+	if v := os.Getenv(key); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		}
+		log.Printf("[config] %s bukan boolean valid (%q), pakai default %v", key, v, fallback)
 	}
 	return fallback
 }

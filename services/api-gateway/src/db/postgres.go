@@ -71,6 +71,9 @@ ALTER TABLE contacts ADD COLUMN IF NOT EXISTS tags       TEXT[]      NOT NULL DE
 ALTER TABLE contacts ADD COLUMN IF NOT EXISTS profile    JSONB       NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE contacts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 ALTER TABLE contacts ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+-- Penanda kontak sudah disimpan ke Google People API (resourceName "people/c…").
+-- Non-kosong = sudah tersinkron; dipakai idempotensi agar tak membuat kontak ganda.
+ALTER TABLE contacts ADD COLUMN IF NOT EXISTS google_resource_name VARCHAR(128);
 
 ALTER TABLE external_contacts ADD COLUMN IF NOT EXISTS email      VARCHAR(255);
 ALTER TABLE external_contacts ADD COLUMN IF NOT EXISTS company    VARCHAR(255);
@@ -454,6 +457,32 @@ func (s *Store) FindContactByName(ctx context.Context, name, company string) (*m
 		return nil, err
 	}
 	return &c, nil
+}
+
+// GoogleResourceName mengembalikan resourceName Google People API yang tersimpan untuk
+// kontak `phone` (string kosong bila belum pernah disinkron atau kontak tak ada). Dipakai
+// sbg penanda idempotensi sebelum membuat kontak Google baru. Bukan error bila kosong.
+func (s *Store) GoogleResourceName(ctx context.Context, phone string) (string, error) {
+	var rn string
+	err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(google_resource_name,'') FROM contacts
+		 WHERE phone = $1 AND deleted_at IS NULL`, phone).Scan(&rn)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return rn, nil
+}
+
+// SetGoogleResourceName menandai kontak `phone` sudah tersinkron ke Google dengan
+// menyimpan resourceName-nya. Idempoten (UPDATE by phone).
+func (s *Store) SetGoogleResourceName(ctx context.Context, phone, resourceName string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE contacts SET google_resource_name = $2
+		 WHERE phone = $1 AND deleted_at IS NULL`, phone, resourceName)
+	return err
 }
 
 // FindContact mencari kontak berdasarkan identifier (phone atau lid).

@@ -48,6 +48,9 @@ type sendTextReq struct {
 	Session string `json:"session"`
 	ChatID  string `json:"chatId"`
 	Text    string `json:"text"`
+	// ReplyTo = ID pesan yang dikutip (fitur reply/quote WhatsApp). Kosong = kirim
+	// biasa tanpa kutipan. Field WAHA: `reply_to`. Lihat SendToChatQuoted.
+	ReplyTo string `json:"reply_to,omitempty"`
 }
 
 // SendText mengirim pesan teks ke nomor tujuan via WAHA.
@@ -85,10 +88,18 @@ func (c *Client) SendText(to, text string) error {
 // pesan masuk, sehingga balasan ke kontak @lid tidak salah dinormalisasi
 // menjadi @c.us.
 func (c *Client) SendToChat(chatID, text string) error {
+	return c.SendToChatQuoted(chatID, text, "")
+}
+
+// SendToChatQuoted sama seperti SendToChat namun MENGUTIP (reply/quote) pesan
+// dengan ID replyToID. Dipakai saat user mengirim beberapa pesan beruntun agar
+// balasan jelas menunjuk pesan yang dijawab. replyToID kosong = tanpa kutipan.
+func (c *Client) SendToChatQuoted(chatID, text, replyToID string) error {
 	payload := sendTextReq{
 		Session: c.session,
 		ChatID:  chatID,
 		Text:    text,
+		ReplyTo: replyToID,
 	}
 	body, _ := json.Marshal(payload)
 
@@ -109,7 +120,11 @@ func (c *Client) SendToChat(chatID, text string) error {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("WAHA sendText HTTP %d: %s", resp.StatusCode, string(b))
 	}
-	log.Printf("[OUTBOUND] -> %s : %q", chatID, text)
+	if replyToID != "" {
+		log.Printf("[OUTBOUND] -> %s (kutip %s) : %q", chatID, replyToID, text)
+	} else {
+		log.Printf("[OUTBOUND] -> %s : %q", chatID, text)
+	}
 	return nil
 }
 
@@ -199,11 +214,6 @@ func (c *Client) ResolvePhoneByLid(lid string) (string, error) {
 }
 
 // DownloadMedia mengunduh file media dari WAHA. rawURL adalah payload.media.url
-// yang memakai host INTERNAL WAHA (mis. http://localhost:3000/...); host-nya
-// ditulis-ulang ke baseURL client agar terjangkau dari lingkungan ini (dev:
-// localhost:13000, prod: waha:3000). WAHA menuntut X-Api-Key (401 tanpa). File
-// bersifat FANA (~WHATSAPP_FILES_LIFETIME) → panggil segera saat webhook tiba.
-// Mengembalikan byte file + Content-Type dari respons.
 func (c *Client) DownloadMedia(rawURL string) ([]byte, string, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -240,6 +250,39 @@ func (c *Client) DownloadMedia(rawURL string) ([]byte, string, error) {
 		return nil, "", fmt.Errorf("media terlalu besar (> %d byte)", maxInboundMediaBytes)
 	}
 	return data, resp.Header.Get("Content-Type"), nil
+}
+
+// CheckNumberExists menanyakan WAHA apakah `phone` (nomor tujuan)
+func (c *Client) CheckNumberExists(phone string) (exists bool, chatID string, err error) {
+	digits := nonDigit.ReplaceAllString(phone, "")
+	if digits == "" {
+		return false, "", fmt.Errorf("nomor kosong")
+	}
+	u := fmt.Sprintf("%s/api/contacts/check-exists?phone=%s&session=%s",
+		c.baseURL, url.QueryEscape(digits), url.QueryEscape(c.session))
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return false, "", err
+	}
+	req.Header.Set("X-Api-Key", c.apiKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, "", fmt.Errorf("check-exists ke WAHA gagal: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return false, "", fmt.Errorf("WAHA check-exists HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	var out struct {
+		NumberExists bool   `json:"numberExists"`
+		ChatID       string `json:"chatId"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false, "", fmt.Errorf("decode check-exists gagal: %w", err)
+	}
+	return out.NumberExists, out.ChatID, nil
 }
 
 // ── Presence (indikator baca & "mengetik…") ───────────────────────

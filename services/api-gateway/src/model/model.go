@@ -317,7 +317,10 @@ type Message struct {
 // Action = instruksi terstruktur dari agent
 // Type yang dikenal: "UPDATE_STATE" (NewState), "NOTIFY_ORCHESTRATOR" (Payload),
 // "SPAWN_AGENT" (Agent/Target/Task + opsional Target*), "CONFIRM_MEETING" (ApprovalID),
-// "RESCHEDULE_MEETING" (MeetingID+NewDatetime), "CANCEL_MEETING" (MeetingID+Reason),
+// "RESCHEDULE_MEETING" (MeetingID+NewDatetime; bila meeting bagian dari grup → KONVERGENSI:
+// seluruh peserta grup dinegosiasi ulang ke waktu itu), "CANCEL_MEETING" (MeetingID+Reason),
+// "SPLIT_GROUP_MEETING" (MeetingID peserta grup yang divergen; opsional NewDatetime untuk
+// jadwal terpisah atau ChangeKind="cancel" untuk mengeluarkannya — peserta lain tetap),
 // "REQUEST_MEETING_CHANGE" (ChangeKind+Reason + opsional NewDatetime), "CONFIRM_VENUE"
 // (VenueName+VenueAddress), "SET_REMINDER" (ReminderTime+ReminderNote + opsional
 // RecurKind/RecurTime/RecurDow/ReminderLabel), "CANCEL_REMINDER" (ReminderID),

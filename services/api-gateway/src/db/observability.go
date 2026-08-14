@@ -443,6 +443,190 @@ func (s *Store) FindPendingSpawnMeeting(ctx context.Context, name, company strin
 	return scanMeetingRow(s.pool.QueryRow(ctx, q, args...))
 }
 
+// FindPendingSpawnMeetingByConversation mencari proposal meeting SPAWN milik SU yang masih
+// pending & belum tertaut approval, di PERCAKAPAN yang sama. Lebih tahan dari pencocokan
+// nama (nama pihak eksternal kerap berubah: ditambah gelar/"Pak", dsb.) karena proposal
+// SPAWN SU dan meeting final dari balasan eksternal selalu berbagi conversation_id yang
+// sama. Dipakai sbg fallback rekonsiliasi agar meeting SU-initiated tak salah label
+// 'external' (yang menyebabkan undangan email tak dikirim).
+func (s *Store) FindPendingSpawnMeetingByConversation(ctx context.Context, convID string) (*model.MeetingRequest, error) {
+	convID = strings.TrimSpace(convID)
+	if convID == "" {
+		return nil, nil
+	}
+	row := s.pool.QueryRow(ctx, `SELECT `+meetingScanCols+`
+		FROM meeting_requests
+		WHERE requested_via = 'su' AND approval_id IS NULL AND status = 'pending'
+		  AND conversation_id = $1
+		ORDER BY id DESC LIMIT 1`, convID)
+	return scanMeetingRow(row)
+}
+
+// MeetingsByGroup mengembalikan seluruh baris meeting AKTIF (belum terminal) yang
+// berbagi groupId (Fase 1 meeting grup), tanpa proposal SPAWN yang sudah di-superseded.
+// Diurut kronologis (id ASC). Kosong bila groupID kosong atau tak ada yang cocok.
+func (s *Store) MeetingsByGroup(ctx context.Context, groupID string) ([]*model.MeetingRequest, error) {
+	groupID = strings.TrimSpace(groupID)
+	if groupID == "" {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `SELECT `+meetingScanCols+`
+		FROM meeting_requests
+		WHERE COALESCE(details->>'groupId','') = $1
+		  AND status NOT IN ('superseded','cancelled')
+		ORDER BY id ASC`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.MeetingRequest
+	for rows.Next() {
+		m, serr := scanMeetingRow(rows)
+		if serr != nil {
+			return nil, serr
+		}
+		if m != nil {
+			out = append(out, m)
+		}
+	}
+	return out, rows.Err()
+}
+
+// GroupAgreedCount menghitung jumlah peserta grup yang SUDAH menyepakati (baris pending
+// yang telah tertaut approval — sinyal "sudah setuju & siap diajukan ke SU"). Dipakai
+// untuk menahan notifikasi SU hingga semua peserta setuju.
+func (s *Store) GroupAgreedCount(ctx context.Context, groupID string) (int, error) {
+	groupID = strings.TrimSpace(groupID)
+	if groupID == "" {
+		return 0, nil
+	}
+	var n int
+	err := s.pool.QueryRow(ctx, `SELECT count(*)
+		FROM meeting_requests
+		WHERE COALESCE(details->>'groupId','') = $1
+		  AND approval_id IS NOT NULL
+		  AND status IN ('pending','approved','scheduled')`, groupID).Scan(&n)
+	return n, err
+}
+
+// MarkGroupApprovalNotified menandai (sekali) bahwa notifikasi persetujuan grup gabungan
+// sudah dikirim ke SU, dan mengembalikan true HANYA untuk pemanggil pertama. Aman terhadap
+// balapan: UPDATE bersyarat pada seluruh baris grup diserialkan oleh row-lock Postgres —
+// pemanggil kedua melihat flag sudah ter-set (0 baris terpengaruh). Mencegah SU menerima
+// dua prompt approval saat peserta terakhir menyetujui hampir bersamaan.
+func (s *Store) MarkGroupApprovalNotified(ctx context.Context, groupID string) (bool, error) {
+	groupID = strings.TrimSpace(groupID)
+	if groupID == "" {
+		return false, nil
+	}
+	ct, err := s.pool.Exec(ctx, `
+		UPDATE meeting_requests
+		SET details = jsonb_set(details, '{groupApprovalNotified}', 'true'::jsonb)
+		WHERE COALESCE(details->>'groupId','') = $1
+		  AND COALESCE(details->>'groupApprovalNotified','') <> 'true'
+		  AND status NOT IN ('superseded','cancelled')`, groupID)
+	if err != nil {
+		return false, err
+	}
+	return ct.RowsAffected() > 0, nil
+}
+
+// ResetGroupAgreementForReschedule mengembalikan SELURUH peserta grup ke kondisi "belum
+// disepakati" untuk negosiasi ulang (KONVERGENSI Fase 2): melepas tautan approval (approval_id
+// → NULL) sehingga GroupAgreedCount ter-reset, membatalkan approval lama yang masih pending
+// (agar balasan SETUJU basi tidak menembak pesan usang), dan menurunkan bendera kesepakatan
+// (timeAgreed/venueConfirmed/groupApprovalNotified) sehingga gerbang notifikasi grup menyala
+// kembali hanya setelah semua peserta menyepakati waktu baru. Dijalankan dalam satu transaksi.
+func (s *Store) ResetGroupAgreementForReschedule(ctx context.Context, groupID string) error {
+	groupID = strings.TrimSpace(groupID)
+	if groupID == "" {
+		return nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Batalkan approval lama (masih pending) yang tertaut peserta grup aktif.
+	if _, err := tx.Exec(ctx, `
+		UPDATE approval_pending SET status = 'rejected', decided_at = now()
+		WHERE status = 'pending'
+		  AND id IN (
+		      SELECT approval_id FROM meeting_requests
+		      WHERE COALESCE(details->>'groupId','') = $1
+		        AND approval_id IS NOT NULL
+		        AND status IN ('pending','approved','scheduled')
+		  )`, groupID); err != nil {
+		return err
+	}
+	// Lepas tautan approval + reset bendera kesepakatan pada peserta grup aktif.
+	if _, err := tx.Exec(ctx, `
+		UPDATE meeting_requests
+		SET approval_id = NULL,
+		    details = jsonb_set(
+		                jsonb_set(
+		                  jsonb_set(details, '{timeAgreed}', 'false'::jsonb),
+		                  '{venueConfirmed}', 'false'::jsonb),
+		                '{groupApprovalNotified}', 'false'::jsonb),
+		    updated_at = now()
+		WHERE COALESCE(details->>'groupId','') = $1
+		  AND status IN ('pending','approved','scheduled')`, groupID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// DetachMeetingFromGroup melepaskan SATU peserta dari grup (SPLIT Fase 2): peserta itu menjadi
+// meeting solo (kunci groupId/groupSize dihapus dari details) dan groupSize peserta grup
+// yang tersisa diturunkan satu. Mengembalikan jumlah peserta grup yang masih tersisa (aktif)
+// setelah pelepasan — pemanggil memakainya untuk memutuskan apakah sisa grup kini lengkap
+// (bisa dinotifikasikan) atau menyusut menjadi solo. Dijalankan dalam satu transaksi.
+func (s *Store) DetachMeetingFromGroup(ctx context.Context, meetingID int64, groupID string) (int, error) {
+	groupID = strings.TrimSpace(groupID)
+	if groupID == "" {
+		return 0, nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	// Peserta yang dilepas menjadi solo — buang kunci grup dari details-nya.
+	if _, err := tx.Exec(ctx, `
+		UPDATE meeting_requests
+		SET details = (details - 'groupId' - 'groupSize' - 'groupApprovalNotified'),
+		    updated_at = now()
+		WHERE id = $1`, meetingID); err != nil {
+		return 0, err
+	}
+	// Turunkan groupSize peserta grup yang tersisa (minimal 1) DAN reset bendera
+	// groupApprovalNotified — komposisi grup berubah, jadi gerbang notifikasi sisa grup
+	// harus menyala kembali (mis. bila divergensi awal sudah menandainya lebih dulu).
+	if _, err := tx.Exec(ctx, `
+		UPDATE meeting_requests
+		SET details = jsonb_set(
+		                jsonb_set(details, '{groupSize}',
+		                  to_jsonb(GREATEST(COALESCE((details->>'groupSize')::int,1) - 1, 1))),
+		                '{groupApprovalNotified}', 'false'::jsonb),
+		    updated_at = now()
+		WHERE COALESCE(details->>'groupId','') = $1
+		  AND id <> $2
+		  AND status IN ('pending','approved','scheduled')`, groupID, meetingID); err != nil {
+		return 0, err
+	}
+	var remaining int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*) FROM meeting_requests
+		WHERE COALESCE(details->>'groupId','') = $1
+		  AND id <> $2
+		  AND status IN ('pending','approved','scheduled')`, groupID, meetingID).Scan(&remaining); err != nil {
+		return 0, err
+	}
+	return remaining, tx.Commit(ctx)
+}
+
 // FindActiveMeetingByPartyAt mencari meeting AKTIF pada datetime dan pihak eksternal
 // yang sama di percakapan berbeda untuk mencegah duplikasi approval/meeting.
 func (s *Store) FindActiveMeetingByPartyAt(ctx context.Context, name string, at time.Time, excludeConvID string) (*model.MeetingRequest, error) {

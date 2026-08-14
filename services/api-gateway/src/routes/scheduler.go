@@ -17,20 +17,13 @@ import (
 	"pa-ai/api-gateway/src/services"
 )
 
-// schedulerPoll = jeda antar pemeriksaan tugas terjadwal. 30 dtk: cukup halus untuk
-// pengingat (granularitas menit) tanpa membebani DB.
+// schedulerPoll = jeda antar pemeriksaan tugas terjadwal.
 const schedulerPoll = 30 * time.Second
 
-// schedulerPrepLead = seberapa awal tugas diklaim sebelum fire_at agar orchestrator
-// sempat MENYUSUN pesan (proses LLM butuh waktu) lalu hasilnya DITAHAN sampai tepat
-// waktu. Harus > durasi penyusunan tipikal. Bila penyusunan lebih lambat dari sisa
-// waktu, pesan tetap dikirim begitu siap (telat sedikit, tak lebih buruk dari dulu).
 const schedulerPrepLead = 90 * time.Second
 
 // StartScheduler menjalankan worker latar belakang yang memeriksa tugas terjadwal
-// (scheduled_tasks) tiap menit. Tugas yang jatuh tempo dikirim ke Pak Sudianto
-// melalui orchestrator (push proaktif). State tersimpan di Postgres sehingga aman
-// terhadap restart. Berhenti saat ctx dibatalkan.
+// (scheduled_tasks) tiap menit.
 func (h *Handler) StartScheduler(ctx context.Context) {
 	if h.SUPhone == "" {
 		log.Printf("[SCHEDULER] SU phone kosong — worker pengingat TIDAK dijalankan")
@@ -39,11 +32,9 @@ func (h *Handler) StartScheduler(ctx context.Context) {
 	log.Printf("[SCHEDULER] worker pengingat aktif (poll tiap %s, susun-awal %s, lead meeting %d menit)",
 		schedulerPoll, schedulerPrepLead, h.reminderLead())
 
-	// Sekali saat start-up: tuntaskan meeting offline yang waktunya sudah disetujui SU &
-	// lokasinya sudah dikonfirmasi Bu Nova tetapi finalisasinya tertahan (mis. terputus).
 	go h.reconcileUnfinalizedOfflineMeetings(context.Background())
 
-	middleware.WorkerHeartbeat("scheduler") // emit awal agar seri muncul segera
+	middleware.WorkerHeartbeat("scheduler")
 	t := time.NewTicker(schedulerPoll)
 	go func() {
 		defer t.Stop()
@@ -236,23 +227,13 @@ func holdUntil(ctx context.Context, releaseAt time.Time) error {
 	}
 }
 
-// deepWorkBudget = batas waktu SATU giliran kerja berat (DEFER_TASK). Jauh di atas
-// OPENCLAW_TIMEOUT_SEC (180 dtk) yang berlaku untuk percakapan biasa: giliran ini
-// berjalan di latar belakang, tak ada yang menunggu di ujung WhatsApp, jadi menelusuri
-// belasan sumber lalu menyusun berkas boleh memakan waktu. Tetap dibatasi agar satu
-// tugas yang macet tidak menahan proses CLI selamanya.
+// deepWorkBudget = batas waktu SATU giliran kerja berat (DEFER_TASK).
 const deepWorkBudget = 15 * time.Minute
 
-// maxPendingDeepWork = batas tugas berat yang boleh mengantre sekaligus. Giliran kerja
-// berat boleh memanggil DEFER_TASK lagi (memang begitu cara memecah pekerjaan panjang
-// jadi beberapa tahap), dan justru itu bahayanya: agent yang salah menilai "belum selesai"
-// akan menunda dirinya sendiri tanpa henti. Batas ini membuat kegagalan itu berhenti
-// sendiri alih-alih membakar giliran LLM diam-diam sampai ada yang menyadarinya.
+// maxPendingDeepWork = batas tugas berat yang boleh mengantre sekaligus.
 const maxPendingDeepWork = 5
 
 // buildDeepWorkInstruction merangkai giliran lanjutan untuk pekerjaan yang ditunda.
-// Nadanya berbeda dari pengingat: ini bukan "sampaikan sesuatu ke Pak Sudianto",
-// melainkan "kerjakan sekarang, lalu laporkan hasilnya".
 func buildDeepWorkInstruction(task model.ScheduledTask) string {
 	var b strings.Builder
 	b.WriteString("[TUGAS TERTUNDA — giliran sistem, BUKAN pesan dari Pak Sudianto]\n")

@@ -81,6 +81,10 @@ type Config struct {
 
 	BurstWindow time.Duration
 
+	AttentionQueue bool
+	// AttentionMaxWait = batas maksimum sebuah percakapan menunggu giliran di gateway
+	AttentionMaxWait time.Duration
+
 	SpawnStaggerInterval time.Duration
 
 	PreflightCheckNumber bool
@@ -174,6 +178,9 @@ func Load() Config {
 		LongReplyThreshold: getenvInt("LONG_REPLY_THRESHOLD_CHARS", 200),
 
 		BurstWindow: time.Duration(getenvInt("BURST_WINDOW_MS", 6000)) * time.Millisecond,
+
+		AttentionQueue:   getenvBool("ATTENTION_QUEUE", true),
+		AttentionMaxWait: time.Duration(getenvInt("ATTENTION_MAX_WAIT_SEC", 480)) * time.Second,
 
 		SpawnStaggerInterval: time.Duration(getenvInt("SPAWN_STAGGER_SEC", 60)) * time.Second,
 
@@ -278,6 +285,15 @@ func Load() Config {
 	} else {
 		log.Printf("[config] BURST_WINDOW: pesan beruntun digabung dalam jendela %v lalu dibalas sekali (kutip pesan terakhir).",
 			cfg.BurstWindow)
+	}
+	if cfg.AttentionMaxWait < 0 {
+		cfg.AttentionMaxWait = 0
+	}
+	if cfg.AttentionQueue {
+		log.Printf("[config] ATTENTION_QUEUE: aktif — 1 percakapan dilayani penuh (baca+mengetik+balas) pada satu waktu; lainnya menunggu (FIFO, maks %v). Orchestrator & admin dikecualikan.",
+			cfg.AttentionMaxWait)
+	} else {
+		log.Println("[config] ATTENTION_QUEUE: nonaktif — semua percakapan dilayani paralel seperti biasa.")
 	}
 	if cfg.SpawnStaggerInterval < 0 {
 		cfg.SpawnStaggerInterval = 0

@@ -483,6 +483,22 @@ func (h *Handler) scheduleMeetingReminder(ctx context.Context, m *model.MeetingR
 		log.Printf("[REMINDER] batalkan pengingat lama meeting #%d gagal: %v", m.ID, err)
 	}
 
+	// Meeting GRUP: satu perintah SU melahirkan SATU baris meeting per peserta, dan
+	// finalisasi memanggil fungsi ini untuk TIAP baris. Tanpa dedup, SU menerima
+	// pengingat sebanyak jumlah peserta.
+	who := firstNonEmptyStr(m.ExternalName, det.AttendeeName)
+	if strings.TrimSpace(det.GroupID) != "" && det.GroupSize >= 2 {
+		canonical, names := h.groupReminderCanonical(ctx, det.GroupID)
+		if canonical != 0 && m.ID != canonical {
+			log.Printf("[REMINDER] meeting #%d bagian grup %s — pengingat dibuat pada baris kanonik #%d, dilewati",
+				m.ID, det.GroupID, canonical)
+			return
+		}
+		if names != "" {
+			who = names
+		}
+	}
+
 	lead := h.reminderLead()
 	fireAt := m.ProposedDatetime.Add(-time.Duration(lead) * time.Minute)
 	if fireAt.Before(time.Now()) {
@@ -491,7 +507,6 @@ func (h *Handler) scheduleMeetingReminder(ctx context.Context, m *model.MeetingR
 	}
 
 	title := firstNonEmptyStr(det.Title, m.Topic, "Meeting")
-	who := firstNonEmptyStr(m.ExternalName, det.AttendeeName)
 	note := buildMeetingReminderNote(title, who, m, det, lead)
 	mid := m.ID
 	id, err := h.Store.CreateScheduledTask(ctx, model.ScheduledTask{
@@ -523,6 +538,49 @@ func buildMeetingReminderNote(title, who string, m *model.MeetingRequest, det me
 		b.WriteString(" Tautan Teams: " + det.TeamsLink + ".")
 	}
 	return b.String()
+}
+
+// groupReminderCanonical menentukan baris meeting KANONIK untuk pengingat grup: ID
+// meeting TERKECIL di antara peserta yang masih punya waktu terjadwal dan belum
+// dibatalkan/ditolak.
+func (h *Handler) groupReminderCanonical(ctx context.Context, groupID string) (int64, string) {
+	meetings, err := h.Store.MeetingsByGroup(ctx, groupID)
+	if err != nil || len(meetings) == 0 {
+		return 0, ""
+	}
+	var canonical int64
+	var names []string
+	for _, m := range meetings {
+		if m == nil || m.ProposedDatetime == nil {
+			continue
+		}
+		if m.Status == "cancelled" || m.Status == "rejected" {
+			continue
+		}
+		if canonical == 0 || m.ID < canonical {
+			canonical = m.ID
+		}
+		var d meetingDetails
+		_ = json.Unmarshal(m.Details, &d)
+		if n := firstNonEmptyStr(m.ExternalName, d.AttendeeName); n != "" {
+			names = append(names, n)
+		}
+	}
+	return canonical, joinNamesID(names)
+}
+
+// joinNamesID menggabungkan nama gaya Indonesia: "A", "A dan B", "A, B dan C".
+func joinNamesID(names []string) string {
+	switch len(names) {
+	case 0:
+		return ""
+	case 1:
+		return names[0]
+	case 2:
+		return names[0] + " dan " + names[1]
+	default:
+		return strings.Join(names[:len(names)-1], ", ") + " dan " + names[len(names)-1]
+	}
 }
 
 // remindExternalForMeeting mengirim pengingat meeting ke eksternal via WhatsApp setelah releaseAt.

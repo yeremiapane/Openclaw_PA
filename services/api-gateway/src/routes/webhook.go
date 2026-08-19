@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"log"
 	"math/rand"
 	"net/http"
@@ -60,20 +61,11 @@ type Handler struct {
 	LongReplyThreshold int
 
 	// BurstWindow = jendela debounce penggabungan pesan beruntun + serialisasi per-chat.
-	// Model: hanya SATU giliran berjalan per chat. Pesan yang datang berdekatan (dalam
-	// BurstWindow) ATAU selagi giliran sebelumnya masih diproses (mis. agen ~2 menit)
-	// ditumpuk ke antrean chat lalu digabung jadi giliran BERIKUTNYA — sehingga tak
-	// pernah ada balasan ganda dan balasan mengutip pesan terakhir bila giliran >= 2
-	// pesan. 0 = nonaktif (tiap pesan diproses sendiri, tanpa serialisasi). Antrean
-	// per-chat di `queues`, diproteksi queueMu. Lihat enqueueTurn()/startTurnLocked()/
-	// finishTurn().
 	BurstWindow time.Duration
 	queueMu     sync.Mutex
 	queues      map[string]*chatQueue
 
-	// SpawnStaggerInterval = jarak minimum antar-kontak keluar (SPAWN_AGENT). Setiap
-	// kontak memesan slot kirim berikutnya lewat gate proses-global di bawah, sehingga
-	// spacing berlaku LINTAS batch DAN lintas giliran/pesan. 0 = serempak (nonaktif).
+	// SpawnStaggerInterval = jarak minimum antar-kontak keluar (SPAWN_AGENT).
 	SpawnStaggerInterval time.Duration
 	// Gate slot-kirim proses-global untuk SPAWN_AGENT. spawnNextSlot = waktu paling awal
 	// kontak berikutnya boleh dikirim; diproteksi spawnGateMu. Lihat reserveSpawnSlot.
@@ -81,8 +73,7 @@ type Handler struct {
 	spawnNextSlot time.Time
 
 	// PreflightCheckNumber = cek nomor tujuan terdaftar di WhatsApp (via WAHA
-	// check-exists) sebelum kontak keluar. Nomor tak terdaftar tidak dikirimi
-	// (anti-463). Fail-open bila cek error. Lihat spawnOutbound.
+	// check-exists) sebelum kontak keluar.
 	PreflightCheckNumber bool
 
 	// Google = client People API (opsional). Bila Enabled, nomor BARU disimpan ke
@@ -100,13 +91,27 @@ type Handler struct {
 	// menolak membaca path di luar direktori ini. Kosong = jalur docPath nonaktif.
 	DocWorkDir string
 
-	// Gerbang "sedang dilayani": jumlah balasan yang sedang dikarang per chat. Selama
-	// sebuah chat masih dilayani (bot sudah menandai baca & sedang mengetik), pesan
-	// SUSULAN tidak diberi jeda-baca acak lagi — langsung ditandai dibaca, meniru
-	// manusia yang sudah terlibat percakapan. Jeda acak hanya berlaku saat chat idle
-	// (tak ada balasan berjalan). Diproteksi engagedMu. Lihat engaged()/beginTyping().
 	engagedMu sync.Mutex
 	engaged   map[string]int
+
+	// AttentionGate = gerbang "perhatian" GLOBAL (kapasitas 1).
+	AttentionGate chan struct{}
+	
+	AttentionMaxWait time.Duration
+}
+
+// attentionExempt menandai agent yang TAK PERNAH menunggu gerbang perhatian global.
+func attentionExempt(agentID string) bool {
+	return agentID == "orchestrator" || agentID == "admin"
+}
+
+// attentionMaxWait = batas tunggu giliran di gerbang perhatian (default 8 menit bila
+// tak diset).
+func (h *Handler) attentionMaxWait() time.Duration {
+	if h.AttentionMaxWait > 0 {
+		return h.AttentionMaxWait
+	}
+	return 8 * time.Minute
 }
 
 // agentForTrust memetakan trust_level kontak ke agent OpenClaw (Fase 8 routing).
@@ -168,30 +173,16 @@ func (h *Handler) WahaInbound(c *gin.Context) {
 	convID := "agent:" + agentID + ":" + keyID
 	from := ev.Payload.From
 
-	// Presence: tandai pesan masuk sudah dibaca (centang biru) SETELAH jeda acak
-	// (READ_DELAY_MIN..MAX, semua trust). `readDone` ditutup begitu centang biru
-	// terkirim, sehingga process() bisa menahan indikator "mengetik…" dan balasan
-	// hingga pesan benar-benar tampak dibaca lebih dulu (urutan natural).
-	// Pesan SUSULAN saat bot masih melayani chat ini (sedang mengetik) → langsung
-	// ditandai dibaca tanpa jeda acak, meniru manusia yang sudah terlibat percakapan.
-	// Jeda-baca acak hanya berlaku saat chat idle (tak ada balasan yang sedang dikarang).
-	skipReadDelay := h.engagedNow(from)
-	readDone := make(chan struct{})
-	go func(chatID, msgID string, skip bool) {
-		defer close(readDone)
-		if !skip {
-			if d := randDelay(h.ReadDelayMin, h.ReadDelayMax); d > 0 {
-				time.Sleep(d)
-			}
-		}
-		if err := h.Waha.SendSeen(chatID, msgID); err != nil {
-			log.Printf("[PRESENCE] sendSeen %s gagal: %v", chatID, err)
-		}
-	}(from, ev.Payload.ID, skipReadDelay)
-
 	// Approval gate: SETUJU/TOLAK via WhatsApp sebelum routing ke agent.
 	if contact.TrustLevel == "su" {
 		if m := approvalCmdRe.FindStringSubmatch(strings.TrimSpace(text)); m != nil {
+			// Perintah SU: tandai dibaca seketika (SU tak pernah menunggu gerbang) lalu
+			// tangani — jalur ini pulang tanpa process(), jadi centang biru dikirim di sini.
+			go func(chatID, msgID string) {
+				if err := h.Waha.SendSeen(chatID, msgID); err != nil {
+					log.Printf("[PRESENCE] sendSeen %s gagal: %v", chatID, err)
+				}
+			}(from, ev.Payload.ID)
 			go h.handleApprovalCommand(from, m[1], m[2])
 			c.JSON(http.StatusOK, gin.H{"status": "approval_command"})
 			return
@@ -214,26 +205,77 @@ func (h *Handler) WahaInbound(c *gin.Context) {
 		}
 	}
 
+	// Susulan (BurstWindow): bila chat ini SEDANG aktif dilayani (giliran berjalan &
+	// gerbang perhatian dipegang → engagedNow, di-set sejak awal process SEBELUM jeda-baca),
+	// pesan berikutnya LANGSUNG ditandai dibaca di sini — meniru manusia yang sudah membuka
+	// & menyimak chat ini. Tanpa ini, susulan hanya akan dibaca saat giliran BERIKUTNYA jalan
+	// (bisa ~1 menit setelah agen selesai), karena process() menandai baca sekali per giliran.
+	// PENTING utk [[attention-queue-global]]: pesan PERTAMA chat idle & pesan dari chat yang
+	// MENUNGGU giliran (belum engaged) TIDAK ditandai di sini — dibiarkan process() menandai
+	// setelah gerbang perhatian memberi giliran, agar percakapan lain tetap tampak belum dibaca.
+	if h.BurstWindow > 0 && h.engagedNow(from) {
+		go func(chatID, msgID string) {
+			if err := h.Waha.SendSeen(chatID, msgID); err != nil {
+				log.Printf("[PRESENCE] sendSeen (susulan) %s gagal: %v", chatID, err)
+			}
+		}(from, ev.Payload.ID)
+	}
+
 	// Proses inject + kirim balasan di luar request lifecycle WAHA.
-	//
-	// Serialisasi + penggabungan (BurstWindow > 0): setiap pesan ditumpuk ke antrean
-	// per-chat. Hanya SATU giliran berjalan per chat; pesan yang datang berdekatan ATAU
-	// selagi giliran sebelumnya masih diproses (agen bisa ~2 menit) digabung menjadi
-	// giliran berikutnya — mencegah balasan ganda dan mengutip pesan terakhir bila satu
-	// giliran memuat >= 2 pesan. Pesan berlampiran ikut antrean (giliran dengan file).
-	// BurstWindow == 0 → jalur lama: tiap pesan diproses sendiri tanpa serialisasi.
 	if h.BurstWindow > 0 {
-		h.enqueueTurn(contact, agentID, convID, from, text, replyTo, file, readDone, ev.Payload.ID)
+		h.enqueueTurn(contact, agentID, convID, from, text, replyTo, file, ev.Payload.ID)
 	} else {
-		go h.process(contact, agentID, convID, from, text, replyTo, file, readDone, "")
+		go h.process(contact, agentID, convID, from, text, replyTo, file, ev.Payload.ID, "")
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "received"})
 }
 
-func (h *Handler) process(contact *model.Contact, agentID, convID, from, text, replyTo string, file *inboundFile, readDone <-chan struct{}, quoteID string) {
+func (h *Handler) process(contact *model.Contact, agentID, convID, from, text, replyTo string, file *inboundFile, lastMsgID, quoteID string) {
+	if h.AttentionGate != nil && !attentionExempt(agentID) {
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), h.attentionMaxWait())
+		select {
+		case h.AttentionGate <- struct{}{}:
+			waitCancel()
+			defer func() { <-h.AttentionGate }()
+			log.Printf("[ATTN] conv=%s mulai dilayani (gerbang perhatian dipegang)", convID)
+		case <-waitCtx.Done():
+			waitCancel()
+			log.Printf("[ATTN] conv=%s menyerah menunggu giliran (> %v) — pesan dilewati", convID, h.attentionMaxWait())
+			return
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
+
+	// Presence: tandai pesan masuk sudah dibaca (centang biru) SETELAH jeda acak
+	// (READ_DELAY_MIN..MAX, semua trust)
+	skipReadDelay := h.engagedNow(from)
+	// Tandai chat "sedang dilayani" SEKARANG — tepat setelah gerbang perhatian dipegang
+	// (atau agen exempt), SEBELUM jeda-baca. Krusial utk read susulan: bila engaged baru
+	// di-set setelah readDone (jeda 1–30s), pesan susulan yang tiba selama jeda-baca tak
+	// tertandai dibaca sampai giliran berikutnya (~semenit). Chat yang masih MENUNGGU
+	// gerbang belum sampai sini → tetap engaged=0 → antrean perhatian tetap utuh.
+	h.markEngaged(from)
+	defer h.unmarkEngaged(from)
+	readDone := make(chan struct{})
+	go func(chatID, msgID string, skip bool) {
+		defer close(readDone)
+		if !skip {
+			if d := randDelay(h.ReadDelayMin, h.ReadDelayMax); d > 0 {
+				select {
+				case <-time.After(d):
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+		if err := h.Waha.SendSeen(chatID, msgID); err != nil {
+			log.Printf("[PRESENCE] sendSeen %s gagal: %v", chatID, err)
+		}
+	}(from, lastMsgID, skipReadDelay)
+
 	// Indikator "mengetik…" baru muncul SETELAH pesan ditandai dibaca (readDone),
 	// agar urutannya natural: centang biru dulu, baru "mengetik…", baru balasan.
 	typingCtx, stopTyping := context.WithCancel(ctx)
@@ -383,11 +425,9 @@ func (h *Handler) typingKeepAlive(ctx context.Context, chatID string, readDone <
 	case <-ctx.Done():
 		return
 	}
-	// Sejak baca selesai & mulai mengetik, tandai chat "sedang dilayani" — sehingga
-	// pesan susulan melewati jeda-baca acak. Dilepas saat mengetik berhenti (balasan
-	// dikirim / sesi selesai).
-	h.markEngaged(chatID)
-	defer h.unmarkEngaged(chatID)
+	// Catatan: penanda "sedang dilayani" (markEngaged) kini di-set di process() sejak
+	// gerbang perhatian dipegang, SEBELUM jeda-baca — agar pesan susulan yang tiba selama
+	// jeda-baca tetap langsung ditandai dibaca. Tak lagi di-set di sini.
 	// Jeda manusiawi antara "centang biru" dan indikator "mengetik…": manusia butuh
 	// sesaat untuk beralih dari membaca ke mengetik. Dibatalkan bila ctx selesai.
 	if d := randDelay(h.PresenceDelayMin, h.PresenceDelayMax); d > 0 {
@@ -458,20 +498,19 @@ type chatQueue struct {
 	agentID   string
 	convID    string
 	from      string
-	texts     []string        // teks pesan tertunda, urut kedatangan
-	replyTo   string          // konteks quote pesan TERAKHIR (bila user membalas)
-	lastMsgID string          // ID pesan terakhir — target kutipan balasan
-	lastRead  <-chan struct{} // readDone pesan terakhir; dipakai process() sbg gerbang
-	file      *inboundFile    // lampiran terakhir (bila ada) — giliran diproses sbg file
-	active    bool            // sebuah giliran sedang diproses untuk chat ini
-	timer     *time.Timer     // debounce sebelum mulai; hanya aktif saat !active
+	texts     []string     // teks pesan tertunda, urut kedatangan
+	replyTo   string       // konteks quote pesan TERAKHIR (bila user membalas)
+	lastMsgID string       // ID pesan terakhir — target centang biru & kutipan balasan
+	file      *inboundFile // lampiran terakhir (bila ada) — giliran diproses sbg file
+	active    bool         // sebuah giliran sedang diproses untuk chat ini
+	timer     *time.Timer  // debounce sebelum mulai; hanya aktif saat !active
 }
 
 // enqueueTurn menumpuk satu pesan ke antrean chat. Bila belum ada giliran berjalan,
 // (ulang) setel timer debounce; saat habis, startTurnLocked menggabung & memproses.
 // Bila giliran sedang berjalan, pesan cukup ditumpuk — finishTurn akan mengambilnya
 // begitu giliran sekarang selesai (mencegah proses paralel → balasan ganda).
-func (h *Handler) enqueueTurn(contact *model.Contact, agentID, convID, from, text, replyTo string, file *inboundFile, readDone <-chan struct{}, msgID string) {
+func (h *Handler) enqueueTurn(contact *model.Contact, agentID, convID, from, text, replyTo string, file *inboundFile, msgID string) {
 	h.queueMu.Lock()
 	defer h.queueMu.Unlock()
 	if h.queues == nil {
@@ -489,7 +528,6 @@ func (h *Handler) enqueueTurn(contact *model.Contact, agentID, convID, from, tex
 	q.texts = append(q.texts, text)
 	q.replyTo = replyTo
 	q.lastMsgID = msgID
-	q.lastRead = readDone
 	if file != nil {
 		q.file = file
 	}
@@ -530,18 +568,18 @@ func (h *Handler) startTurnLocked(from string) {
 		q.timer.Stop()
 		q.timer = nil
 	}
-	combined, quoteID := burstCombine(q.texts, q.lastMsgID)
+	lastMsgID := q.lastMsgID
+	combined, quoteID := burstCombine(q.texts, lastMsgID)
 	contact, agentID, convID := q.contact, q.agentID, q.convID
-	replyTo, file, lastRead := q.replyTo, q.file, q.lastRead
+	replyTo, file := q.replyTo, q.file
 	// Konsumsi buffer: giliran ini mengambil semua yang tertunda.
 	q.texts = nil
 	q.replyTo = ""
 	q.lastMsgID = ""
 	q.file = nil
-	q.lastRead = nil
 	q.active = true
 	go func() {
-		h.process(contact, agentID, convID, from, combined, replyTo, file, lastRead, quoteID)
+		h.process(contact, agentID, convID, from, combined, replyTo, file, lastMsgID, quoteID)
 		h.finishTurn(from)
 	}()
 }
@@ -2275,11 +2313,11 @@ func (h *Handler) rescheduleDispatch(initiator *model.Contact, a model.Action) {
 	m, err := h.Store.MeetingByID(ctx, a.MeetingID)
 	if err != nil || m == nil {
 		log.Printf("[RESCHEDULE] meeting #%d tidak ditemukan: %v", a.MeetingID, err)
-		h.notifySU(fmt.Sprintf("Maaf, meeting #%d tidak ditemukan. Reschedule dibatalkan.", a.MeetingID))
+		h.notifySU("Maaf, meeting yang dimaksud tidak ditemukan. Reschedule dibatalkan.")
 		return
 	}
 	if m.Status == "cancelled" || m.Status == "rejected" {
-		h.notifySU(fmt.Sprintf("Meeting #%d sudah %s — tidak dapat dijadwalkan ulang.", m.ID, meetingStatusID(m.Status)))
+		h.notifySU(fmt.Sprintf("Meeting dengan %s sudah %s — tidak dapat dijadwalkan ulang.", meetingWho(m), meetingStatusID(m.Status)))
 		return
 	}
 
@@ -2294,7 +2332,7 @@ func (h *Handler) rescheduleDispatch(initiator *model.Contact, a model.Action) {
 
 	if derr := h.dispatchRescheduleNegotiation(ctx, m, a); derr != nil {
 		log.Printf("[RESCHEDULE] dispatch PA Communicator #%d gagal: %v", m.ID, derr)
-		h.notifySU(fmt.Sprintf("⚠️ Gagal menghubungi pihak terkait untuk reschedule meeting #%d. Silakan coba lagi sebentar.", m.ID))
+		h.notifySU(fmt.Sprintf("⚠️ Gagal menghubungi pihak terkait untuk reschedule meeting dengan %s. Silakan coba lagi sebentar.", meetingWho(m)))
 		return
 	}
 	log.Printf("[RESCHEDULE] PA Communicator ditugaskan menegosiasikan waktu baru meeting #%d", m.ID)
@@ -2408,17 +2446,17 @@ func (h *Handler) splitGroupDispatch(initiator *model.Contact, a model.Action) {
 
 	m, err := h.Store.MeetingByID(ctx, a.MeetingID)
 	if err != nil || m == nil {
-		h.notifySU(fmt.Sprintf("Maaf, meeting #%d tidak ditemukan. Pemisahan dibatalkan.", a.MeetingID))
+		h.notifySU("Maaf, meeting yang dimaksud tidak ditemukan. Pemisahan dibatalkan.")
 		return
 	}
 	if m.Status == "cancelled" || m.Status == "rejected" {
-		h.notifySU(fmt.Sprintf("Meeting #%d sudah %s — tidak dapat dipisah.", m.ID, meetingStatusID(m.Status)))
+		h.notifySU(fmt.Sprintf("Meeting dengan %s sudah %s — tidak dapat dipisah.", meetingWho(m), meetingStatusID(m.Status)))
 		return
 	}
 	var det meetingDetails
 	_ = json.Unmarshal(m.Details, &det)
 	if strings.TrimSpace(det.GroupID) == "" || det.GroupSize < 2 {
-		h.notifySU(fmt.Sprintf("Meeting #%d bukan bagian dari meeting grup — tidak ada yang perlu dipisah.", m.ID))
+		h.notifySU(fmt.Sprintf("Meeting dengan %s bukan bagian dari meeting grup — tidak ada yang perlu dipisah.", meetingWho(m)))
 		return
 	}
 	groupID := det.GroupID
@@ -2508,11 +2546,11 @@ func (h *Handler) cancelDispatch(initiator *model.Contact, a model.Action) {
 	m, err := h.Store.MeetingByID(ctx, a.MeetingID)
 	if err != nil || m == nil {
 		log.Printf("[CANCEL] meeting #%d tidak ditemukan: %v", a.MeetingID, err)
-		h.notifySU(fmt.Sprintf("Maaf, meeting #%d tidak ditemukan. Pembatalan dibatalkan.", a.MeetingID))
+		h.notifySU("Maaf, meeting yang dimaksud tidak ditemukan. Pembatalan dibatalkan.")
 		return
 	}
 	if m.Status == "cancelled" || m.Status == "rejected" {
-		h.notifySU(fmt.Sprintf("Meeting #%d memang sudah %s.", m.ID, meetingStatusID(m.Status)))
+		h.notifySU(fmt.Sprintf("Meeting dengan %s memang sudah %s.", meetingWho(m), meetingStatusID(m.Status)))
 		return
 	}
 
@@ -2592,8 +2630,8 @@ func (h *Handler) cancelDispatch(initiator *model.Contact, a model.Action) {
 	}
 
 	who := firstNonEmptyStr(m.ExternalName, det.AttendeeName, "pihak terkait")
-	h.notifySU(fmt.Sprintf("✅ Meeting #%d dengan %s dibatalkan. PA Communicator sudah mengabari pihak terkait%s%s.%s",
-		m.ID, who, emailNote, calNote, novaNote))
+	h.notifySU(fmt.Sprintf("✅ Meeting dengan %s dibatalkan. PA Communicator sudah mengabari pihak terkait%s%s.%s",
+		who, emailNote, calNote, novaNote))
 }
 
 // requestMeetingChange meneruskan permintaan perubahan jadwal dari pihak eksternal ke Pak Sudianto.
@@ -2634,13 +2672,13 @@ func (h *Handler) requestMeetingChange(ctx context.Context, convID string, conta
 	var msg string
 	switch kind {
 	case "cancel":
-		msg = fmt.Sprintf("📩 %s meminta *pembatalan* meeting #%d%s.", who, m.ID, when)
+		msg = fmt.Sprintf("📩 %s meminta *pembatalan* meeting%s.", who, when)
 		if reason != "" {
 			msg += " Alasan: " + reason + "."
 		}
-		msg += fmt.Sprintf("\n\nUntuk membatalkan, beri tahu saya: \"batalkan meeting #%d\". Untuk menolak permintaan, abaikan saja.", m.ID)
+		msg += fmt.Sprintf("\n\nUntuk membatalkan, beri tahu saya: \"batalkan meeting dengan %s\". Untuk menolak permintaan, abaikan saja.", who)
 	case "reschedule":
-		msg = fmt.Sprintf("📩 %s meminta *perubahan jadwal* meeting #%d%s.", who, m.ID, when)
+		msg = fmt.Sprintf("📩 %s meminta *perubahan jadwal* meeting%s.", who, when)
 		if nt := strings.TrimSpace(a.NewDatetime); nt != "" {
 			if t, perr := time.Parse(time.RFC3339, nt); perr == nil {
 				msg += " Usulan waktu baru: " + formatWIBLong(t) + "."
@@ -2649,7 +2687,7 @@ func (h *Handler) requestMeetingChange(ctx context.Context, convID string, conta
 		if reason != "" {
 			msg += " Alasan: " + reason + "."
 		}
-		msg += fmt.Sprintf("\n\nUntuk menyetujui, beri tahu saya: \"ubah meeting #%d ke <tanggal & jam>\".", m.ID)
+		msg += fmt.Sprintf("\n\nUntuk menyetujui, beri tahu saya: \"ubah meeting dengan %s ke <tanggal & jam>\".", who)
 	default:
 		log.Printf("[CHANGE-REQ] changeKind tak dikenal (%q) conv=%s — diabaikan", a.ChangeKind, convID)
 		return
@@ -2729,7 +2767,7 @@ func (h *Handler) requestGroupMeetingChange(ctx context.Context, m *model.Meetin
 		b.WriteString("\n\nStatus peserta:\n" + strings.Join(lines, "\n"))
 	}
 	b.WriteString("\n\nPilihan Anda:\n")
-	b.WriteString(fmt.Sprintf("(A) *Pindahkan semua* ke waktu baru — balas: \"ubah meeting grup #%d ke <tanggal & jam>\".\n", m.ID))
+	b.WriteString("(A) *Pindahkan semua* ke waktu baru — balas: \"ubah meeting grup ke <tanggal & jam>\".\n")
 	if kind == "cancel" {
 		b.WriteString(fmt.Sprintf("(B) *Lepaskan %s* dari grup (peserta lain tetap) — balas: \"keluarkan %s dari meeting grup\".", who, who))
 	} else {
@@ -2741,6 +2779,22 @@ func (h *Handler) requestGroupMeetingChange(ctx context.Context, m *model.Meetin
 	}
 	h.notifySU(b.String())
 	log.Printf("[CHANGE-REQ-GRP] divergensi grup %s dari %s (kind=%s) dilaporkan ke SU", det.GroupID, who, kind)
+}
+
+// meetingWho merangkai nama pihak meeting untuk pesan ke SU tanpa ID mentah
+// (mis. "Pak Ikrom (Hypernet)"). Orchestrator tetap memetakan ke meetingId lewat
+// snapshot [STATUS MEETING TERKINI], jadi SU cukup menyebut nama/waktu.
+func meetingWho(m *model.MeetingRequest) string {
+	if m == nil {
+		return "pihak terkait"
+	}
+	var det meetingDetails
+	_ = json.Unmarshal(m.Details, &det)
+	who := firstNonEmptyStr(strings.TrimSpace(m.ExternalName), strings.TrimSpace(det.AttendeeName), "pihak terkait")
+	if c := strings.TrimSpace(m.ExternalCompany); c != "" {
+		who += " (" + c + ")"
+	}
+	return who
 }
 
 // notifySU mengirim satu pesan WhatsApp ringkas ke Pak Sudianto (helper kecil).
@@ -3466,12 +3520,12 @@ func (h *Handler) notifySUGroupApproval(ctx context.Context, groupID string, pri
 	if solo {
 		lead = "Peserta telah menyepakati waktu"
 	}
-	tail := "Balas *SETUJU %d* untuk menyetujui SELURUH peserta sekaligus, atau *TOLAK %d* untuk batal."
+	tail := "Balas *SETUJU* untuk menyetujui SELURUH peserta sekaligus, atau *TOLAK* untuk batal."
 	if solo {
-		tail = "Balas *SETUJU %d* untuk konfirmasi, atau *TOLAK %d* untuk batal."
+		tail = "Balas *SETUJU* untuk konfirmasi, atau *TOLAK* untuk batal."
 	}
 	body := fmt.Sprintf("%s\n%s:\n\n%s\n\nTopik: %s%s\n\n"+tail,
-		header, lead, strings.Join(lines, "\n"), topic, coordNote, primaryApprovalID, primaryApprovalID)
+		header, lead, strings.Join(lines, "\n"), topic, coordNote)
 
 	ap := primaryApprovalID
 	convID := ""
@@ -3628,17 +3682,17 @@ func (h *Handler) DecideApproval(ctx context.Context, id int64, approve bool) (s
 
 	ap, sendFailed, err := h.applyApprovalDecision(ctx, id, approve)
 	if errors.Is(err, db.ErrApprovalNotFound) {
-		return fmt.Sprintf("Approval #%d tidak ditemukan atau sudah diputuskan.", id), err
+		return "Permintaan tidak ditemukan atau sudah diputuskan.", err
 	}
 	if err != nil && !sendFailed {
 		log.Printf("[APPROVAL] decide gagal #%d: %v", id, err)
-		return fmt.Sprintf("Gagal memproses approval #%d.", id), err
+		return "Maaf, gagal memproses permintaan.", err
 	}
 	if !approve {
-		return fmt.Sprintf("❌ Approval #%d ditolak. Pesan tidak dikirim.", id), nil
+		return "❌ Ditolak. Pesan tidak dikirim.", nil
 	}
 	if sendFailed {
-		return fmt.Sprintf("⚠️ Approval #%d disetujui tapi gagal mengirim pesan: %v", id, err), err
+		return fmt.Sprintf("⚠️ Disetujui, tetapi pesan gagal terkirim: %v", err), err
 	}
 	_ = ap
 
@@ -3657,12 +3711,12 @@ func (h *Handler) DecideApproval(ctx context.Context, id int64, approve bool) (s
 					go h.dispatchVenueCoordination(m.ID, det, m.ProposedDatetime)
 				}
 				log.Printf("[APPROVAL] #%d (meeting #%d) waktu disetujui — koordinasi venue ke Bu Nova", id, m.ID)
-				return fmt.Sprintf("✅ Approval #%d disetujui — waktu dikonfirmasi. Bu Nova sedang dikoordinasikan "+
-					"untuk lokasi; konfirmasi final (entri kalender + pesan ke pihak eksternal) akan menyusul "+
-					"otomatis setelah lokasi pasti. Pihak eksternal akan diminta mengirim undangan/link ke pa@hypernet.co.id.", id), nil
+				return "✅ Disetujui — waktu dikonfirmasi. Bu Nova sedang dikoordinasikan " +
+					"untuk lokasi; konfirmasi final (entri kalender + pesan ke pihak eksternal) akan menyusul " +
+					"otomatis setelah lokasi pasti." + inviteDirectionNote(m.RequestedVia), nil
 			}
 			go h.finalizeOfflineMeeting(m.ID)
-			return fmt.Sprintf("✅ Approval #%d disetujui — lokasi sudah pasti, meeting offline sedang difinalisasi.", id), nil
+			return "✅ Disetujui — lokasi sudah pasti, meeting offline sedang difinalisasi.", nil
 		}
 	}
 
@@ -3670,7 +3724,7 @@ func (h *Handler) DecideApproval(ctx context.Context, id int64, approve bool) (s
 	// tertaut dengan datetime valid
 	schedMsg := h.scheduleApprovedMeeting(ctx, id)
 
-	return fmt.Sprintf("✅ Approval #%d disetujui. Pesan telah dikirim.%s", id, schedMsg), nil
+	return "✅ Disetujui. Pesan telah dikirim." + schedMsg, nil
 }
 
 // applyApprovalDecision menerapkan keputusan approve/reject untuk SATU approval: menandai
@@ -3735,10 +3789,10 @@ func (h *Handler) decideGroupApproval(ctx context.Context, primaryID int64, appr
 	// (1) Terapkan keputusan ke peserta pertama (yang id-nya dibalas SU).
 	_, primFailed, err := h.applyApprovalDecision(ctx, primaryID, approve)
 	if errors.Is(err, db.ErrApprovalNotFound) {
-		return fmt.Sprintf("Approval #%d tidak ditemukan atau sudah diputuskan.", primaryID), err
+		return "Permintaan tidak ditemukan atau sudah diputuskan.", err
 	}
 	if err != nil && !primFailed {
-		return fmt.Sprintf("Gagal memproses approval grup #%d.", primaryID), err
+		return "Maaf, gagal memproses permintaan meeting grup.", err
 	}
 
 	// (2) Terapkan keputusan yang SAMA ke peserta grup lain (masing-masing punya approval).
@@ -3770,10 +3824,14 @@ func (h *Handler) decideGroupApproval(ctx context.Context, primaryID int64, appr
 	if groupIsOffline(meetings) {
 		// Satu koordinasi venue untuk SELURUH peserta grup.
 		go h.dispatchGroupVenueCoordination(groupID)
+		via := ""
+		if len(meetings) > 0 {
+			via = meetings[0].RequestedVia
+		}
 		log.Printf("[GROUP] %s disetujui (%d peserta) — koordinasi venue tunggal ke Bu Nova", groupID, done)
 		return fmt.Sprintf("✅ Meeting grup disetujui — waktu dikonfirmasi untuk %d peserta. Bu Nova "+
-			"dikoordinasikan SEKALI untuk lokasi; finalisasi otomatis setelah lokasi pasti. Pihak eksternal "+
-			"akan diminta mengirim undangan/link ke pa@hypernet.co.id.", done), nil
+			"dikoordinasikan SEKALI untuk lokasi; finalisasi otomatis setelah lokasi pasti.%s",
+			done, inviteDirectionNote(via)), nil
 	}
 	// Online: jadwalkan tiap peserta (masing-masing perlu event kalender + undangan sendiri).
 	var sb strings.Builder
@@ -3913,29 +3971,45 @@ func (h *Handler) scheduleApprovedMeeting(ctx context.Context, approvalID int64)
 
 // createEventAndInvite membuat event kalender baru (online → Teams joinUrl otomatis),
 // mengirim RSVP email bila email diketahui, menandai meeting 'scheduled', lalu menjadwalkan
-// pengingat. Dipakai bersama oleh scheduleApprovedMeeting (meeting online, approval biasa)
-// dan finalizeOfflineMeeting (meeting offline, setelah venue pasti). Mengembalikan suffix
-// status. Pemanggil memastikan m.ProposedDatetime != nil & layanan aktif.
+// pengingat.
 func (h *Handler) createEventAndInvite(ctx context.Context, m *model.MeetingRequest, det meetingDetails, title string, duration int) string {
 	// KEBIJAKAN BARU: untuk meeting yang diinisiasi pihak EKSTERNAL, PIHAK EKSTERNAL yang
 	// mengirim undangan/link meeting ke pa@hypernet.co.id — PA tidak lagi mengundang mereka.
-	// Maka: jangan tambahkan mereka sebagai attendee (agar MS Graph tidak mengirim undangan
-	// kalender), jangan buat Teams link tandingan, dan jangan kirim RSVP. Event kalender
-	// tetap dibuat sebagai entri jadwal Pak Sudianto (dan dasar pengingat).
 	externalHosted := m.RequestedVia == "external"
 	isOnline := strings.TrimSpace(m.Venue) == ""
 	dt := m.ProposedDatetime.Format(time.RFC3339)
+	isGroup := strings.TrimSpace(det.GroupID) != "" && det.GroupSize >= 2
+
+	// Meeting GRUP: seluruh peserta berbagi SATU event kalender di kalender SU (bukan N
+	// event terpisah).
+	if isGroup {
+		if shared := h.sharedGroupEvent(ctx, det.GroupID, m.ID); shared != nil {
+			return h.attachSharedGroupEvent(ctx, m, det, title, duration, *shared, externalHosted)
+		}
+	}
 
 	var attendees []string
-	if !externalHosted && det.AttendeeEmail != "" {
+	if isGroup {
+		// Event tunggal grup mengundang SEMUA peserta sekaligus.
+		attendees = h.groupAttendeeEmails(ctx, det.GroupID)
+	} else if !externalHosted && det.AttendeeEmail != "" {
 		attendees = append(attendees, det.AttendeeEmail)
 	}
 	createOnline := isOnline && !externalHosted // eksternal: link disiapkan pihak eksternal
 
+	// Daftar nama peserta untuk deskripsi event kalender SU (grup → semua nama; solo →
+	// satu nama). Membantu SU melihat SIAPA yang ikut langsung dari kalendernya.
+	var names []string
+	if isGroup {
+		names = h.groupParticipantNames(ctx, det.GroupID)
+	} else if n := firstNonEmptyStr(det.AttendeeName, m.ExternalName); n != "" {
+		names = []string{n}
+	}
+
 	// 1) Buat Calendar event (online non-eksternal → dapat Teams joinUrl otomatis).
 	ev, err := h.Services.CreateEvent(ctx, services.CreateEventReq{
 		Title: title, Datetime: dt, DurationMinutes: duration, Venue: m.Venue,
-		Attendees: attendees, IsOnline: createOnline,
+		Attendees: attendees, IsOnline: createOnline, Body: buildEventBody(names),
 	})
 	if err != nil {
 		log.Printf("[SCHEDULE] buat event meeting #%d gagal: %v", m.ID, err)
@@ -3977,6 +4051,125 @@ func (h *Handler) createEventAndInvite(ctx context.Context, m *model.MeetingRequ
 	return fmt.Sprintf("\n📅 Meeting dijadwalkan (event kalender dibuat)%s.", emailNote)
 }
 
+// sharedGroupEvent mengembalikan detail event kalender yang SUDAH dibuat oleh peserta
+// grup lain (EventID + link), atau nil bila belum ada.
+func (h *Handler) sharedGroupEvent(ctx context.Context, groupID string, excludeID int64) *meetingDetails {
+	meetings, err := h.Store.MeetingsByGroup(ctx, groupID)
+	if err != nil {
+		return nil
+	}
+	for _, mm := range meetings {
+		if mm == nil || mm.ID == excludeID {
+			continue
+		}
+		var d meetingDetails
+		_ = json.Unmarshal(mm.Details, &d)
+		if strings.TrimSpace(d.EventID) != "" {
+			return &d
+		}
+	}
+	return nil
+}
+
+// groupParticipantNames mengumpulkan NAMA semua peserta grup (unik, non-kosong) yang belum
+// dibatalkan — dipakai untuk deskripsi event kalender SU agar terlihat siapa saja yang ikut.
+func (h *Handler) groupParticipantNames(ctx context.Context, groupID string) []string {
+	meetings, err := h.Store.MeetingsByGroup(ctx, groupID)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var out []string
+	for _, mm := range meetings {
+		if mm == nil || mm.Status == "cancelled" || mm.Status == "rejected" {
+			continue
+		}
+		var d meetingDetails
+		_ = json.Unmarshal(mm.Details, &d)
+		n := firstNonEmptyStr(d.AttendeeName, mm.ExternalName)
+		if n == "" {
+			continue
+		}
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	return out
+}
+
+// buildEventBody menyusun deskripsi (HTML) event kalender berisi daftar peserta yang ikut.
+// Kosong bila tak ada nama.
+func buildEventBody(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	return "Peserta yang diundang: " + html.EscapeString(joinNamesID(names)) + "."
+}
+
+func (h *Handler) groupAttendeeEmails(ctx context.Context, groupID string) []string {
+	meetings, err := h.Store.MeetingsByGroup(ctx, groupID)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var out []string
+	for _, mm := range meetings {
+		if mm == nil || mm.RequestedVia == "external" {
+			continue
+		}
+		var d meetingDetails
+		_ = json.Unmarshal(mm.Details, &d)
+		e := strings.TrimSpace(d.AttendeeEmail)
+		if e == "" {
+			continue
+		}
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		out = append(out, e)
+	}
+	return out
+}
+
+// attachSharedGroupEvent memakai ULANG event kalender grup yang sudah dibuat peserta lain:
+// salin EventID + link ke detail peserta ini, kirim RSVP personalnya, tandai scheduled, lalu
+// jadwalkan pengingat (yang sendiri sudah dedup grup).
+func (h *Handler) attachSharedGroupEvent(ctx context.Context, m *model.MeetingRequest, det meetingDetails, title string, duration int, shared meetingDetails, externalHosted bool) string {
+	det.EventID = shared.EventID
+	det.CalendarLink = shared.CalendarLink
+	det.TeamsLink = shared.TeamsLink
+	dt := m.ProposedDatetime.Format(time.RFC3339)
+
+	emailNote := ""
+	switch {
+	case externalHosted:
+		emailNote = " (pihak eksternal diminta mengirim undangan/link meeting ke pa@hypernet.co.id)"
+	case det.AttendeeEmail != "":
+		if err := h.Services.SendRSVP(ctx, services.RSVPReq{
+			To: det.AttendeeEmail, ToName: firstNonEmptyStr(det.AttendeeName, m.ExternalName, det.AttendeeEmail),
+			Title: title, Datetime: dt, DurationMinutes: duration, Venue: m.Venue,
+			CalendarLink: shared.CalendarLink, TeamsLink: shared.TeamsLink,
+		}); err != nil {
+			log.Printf("[SCHEDULE] kirim RSVP (event grup) meeting #%d gagal: %v", m.ID, err)
+			emailNote = " (email undangan gagal terkirim)"
+		} else {
+			log.Printf("[SCHEDULE] RSVP terkirim ke %s meeting #%d (event grup %s dipakai ulang)", det.AttendeeEmail, m.ID, shared.EventID)
+		}
+	default:
+		emailNote = " (email kontak tidak diketahui, undangan tidak dikirim)"
+	}
+
+	newDetails, _ := json.Marshal(det)
+	if err := h.Store.ScheduleMeeting(ctx, m.ID, newDetails, "su", "dijadwalkan (event kalender grup dipakai ulang)"); err != nil {
+		log.Printf("[SCHEDULE] tandai scheduled meeting #%d gagal: %v", m.ID, err)
+	}
+	h.scheduleMeetingReminder(ctx, m, det)
+	return fmt.Sprintf("\n📅 Meeting dijadwalkan (bergabung ke event kalender grup)%s.", emailNote)
+}
+
 // finalizeOfflineMeeting menyelesaikan meeting offline setelah lokasi dikonfirmasi —
 // tanpa persetujuan SU kedua.
 func (h *Handler) finalizeOfflineMeeting(meetingID int64) {
@@ -4005,8 +4198,8 @@ func (h *Handler) finalizeOfflineMeeting(meetingID int64) {
 		return
 	}
 	who := firstNonEmptyStr(det.AttendeeName, m.ExternalName, "pihak terkait")
-	h.notifySU(fmt.Sprintf("✅ Meeting offline #%d dengan %s telah dikonfirmasi lengkap — \n\n 🗓️ %s \n📍 %s.%s",
-		m.ID, who, formatWIBLong(*m.ProposedDatetime), m.Venue, suffix))
+	h.notifySU(fmt.Sprintf("✅ Meeting offline dengan %s telah dikonfirmasi lengkap — \n\n 🗓️ %s \n📍 %s.%s",
+		who, formatWIBLong(*m.ProposedDatetime), m.Venue, suffix))
 	log.Printf("[VENUE-FINAL] meeting #%d difinalisasi (venue=%q)", m.ID, m.Venue)
 }
 
@@ -4063,6 +4256,34 @@ func (h *Handler) finalizeOfflineGroup(groupID string) {
 	log.Printf("[VENUE-FINAL] grup %s difinalisasi (%d peserta, venue=%q)", groupID, done, venue)
 }
 
+// inviteDirectionNote mengembalikan catatan arah undangan (SU-facing) sesuai penginisiasi
+// meeting.
+func inviteDirectionNote(requestedVia string) string {
+	if requestedVia == "external" {
+		return " Pihak eksternal akan diminta mengirim undangan/link ke pa@hypernet.co.id."
+	}
+	return " Undangan kalender akan kami kirimkan ke pihak eksternal."
+}
+
+// participantInviteLine menyusun kalimat arah undangan yang DIKIRIM ke pihak eksternal saat
+// konfirmasi akhir meeting offline. Selaras dengan inviteDirectionNote namun dari sudut
+// pandang pihak eksternal (lihat [[su-initiated-invite-direction]]):
+//   - external-initiated → minta mereka kirim undangan/link ke pa@hypernet.co.id.
+//   - SU-initiated + email diketahui → beri tahu undangan kalender sudah dikirim ke email mereka.
+//   - SU-initiated + email belum ada → minta alamat email agar undangan bisa dikirim.
+//
+// Selalu diakhiri spasi agar aman disambung sebelum "Sampai jumpa di sana".
+func participantInviteLine(requestedVia, attendeeEmail string) string {
+	switch {
+	case requestedVia == "external":
+		return "Bila ada undangan/agenda meeting, mohon dikirimkan ke email kami di pa@hypernet.co.id ya. "
+	case strings.TrimSpace(attendeeEmail) != "":
+		return "Undangan kalender sudah kami kirimkan ke email Anda. "
+	default:
+		return "Bila berkenan, mohon informasikan alamat email Anda agar undangan kalender dapat kami kirimkan. "
+	}
+}
+
 func (h *Handler) finalizeOfflineMeetingCore(ctx context.Context, m *model.MeetingRequest) (bool, string) {
 	var det meetingDetails
 	_ = json.Unmarshal(m.Details, &det)
@@ -4094,9 +4315,9 @@ func (h *Handler) finalizeOfflineMeetingCore(ctx context.Context, m *model.Meeti
 			greet = "Halo " + who
 		}
 		extMsg := fmt.Sprintf("%s, pertemuan dengan Pak Sudianto sudah dikonfirmasi sepenuhnya:\n"+
-			"🗓️ %s\n📍 %s\nTopik: %s.\n\nBila ada undangan/agenda meeting, mohon dikirimkan ke email kami "+
-			"di pa@hypernet.co.id ya. Sampai jumpa di sana, terima kasih. 🙏",
-			greet, formatWIBLong(*m.ProposedDatetime), m.Venue, title)
+			"🗓️ %s\n📍 %s\nTopik: %s.\n\n%sSampai jumpa di sana, terima kasih. 🙏",
+			greet, formatWIBLong(*m.ProposedDatetime), m.Venue, title,
+			participantInviteLine(m.RequestedVia, det.AttendeeEmail))
 		agentID := firstNonEmptyStr(m.AgentID, "pa_communicator")
 		h.sendAndRecord(ctx, func() error { return h.Waha.SendToChat(externalChat, extMsg) },
 			model.OutboundMessage{
@@ -4167,18 +4388,31 @@ func (h *Handler) finalizeReschedule(ctx context.Context, m *model.MeetingReques
 	dtNew := m.ProposedDatetime.Format(time.RFC3339)
 	venue := m.Venue
 
-	ev, err := h.Services.RescheduleEvent(ctx, services.UpdateEventReq{
-		EventID: det.EventID, Title: title, Datetime: dtNew, DurationMinutes: duration, Venue: venue,
-	})
-	if err != nil {
-		log.Printf("[RESCHEDULE] PATCH event meeting #%d gagal: %v", m.ID, err)
-		return "\n⚠️ Gagal memperbarui event kalender — silakan periksa manual."
+	// Meeting GRUP berbagi SATU event kalender → PATCH cukup SEKALI (pada baris kanonik =
+	// ID terkecil) agar MS Graph tidak mengirim beruntun notifikasi pembaruan ke semua
+	// peserta.
+	patchEvent := true
+	if strings.TrimSpace(det.GroupID) != "" && det.GroupSize >= 2 {
+		if canonical, _ := h.groupReminderCanonical(ctx, det.GroupID); canonical != 0 && m.ID != canonical {
+			patchEvent = false
+		}
 	}
-	det.CalendarLink = ev.CalendarLink
-	if ev.OnlineMeetingURL != "" {
-		det.TeamsLink = ev.OnlineMeetingURL
+	if patchEvent {
+		ev, err := h.Services.RescheduleEvent(ctx, services.UpdateEventReq{
+			EventID: det.EventID, Title: title, Datetime: dtNew, DurationMinutes: duration, Venue: venue,
+		})
+		if err != nil {
+			log.Printf("[RESCHEDULE] PATCH event meeting #%d gagal: %v", m.ID, err)
+			return "\n⚠️ Gagal memperbarui event kalender — silakan periksa manual."
+		}
+		det.CalendarLink = ev.CalendarLink
+		if ev.OnlineMeetingURL != "" {
+			det.TeamsLink = ev.OnlineMeetingURL
+		}
+		log.Printf("[RESCHEDULE] meeting #%d event %s diperbarui ke %s", m.ID, det.EventID, dtNew)
+	} else {
+		log.Printf("[RESCHEDULE] meeting #%d bagian grup — event bersama sudah di-PATCH baris kanonik, hanya kirim email personal", m.ID)
 	}
-	log.Printf("[RESCHEDULE] meeting #%d event %s diperbarui ke %s", m.ID, det.EventID, dtNew)
 
 	// KEBIJAKAN BARU: meeting yang diinisiasi pihak eksternal → pihak eksternal yang
 	// memperbarui undangan/link ke pa@hypernet.co.id; PA tidak mengirim email jadwal baru.

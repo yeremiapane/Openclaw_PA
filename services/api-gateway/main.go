@@ -74,6 +74,12 @@ func main() {
 	}
 
 	h := &routes.Handler{Waha: wahaClient, Store: store, OpenClaw: openClawClient, Memory: mem, Services: svcClient, SUPhone: cfg.SUPhone, NovaPhone: cfg.NovaPhone, AdminPhone: cfg.AdminPhone, ReminderLeadMinutes: cfg.ReminderLeadMinutes, ReadDelayMin: cfg.ReadDelayMin, ReadDelayMax: cfg.ReadDelayMax, PresenceDelayMin: cfg.PresenceDelayMin, PresenceDelayMax: cfg.PresenceDelayMax, LongReplyDelayMin: cfg.LongReplyDelayMin, LongReplyDelayMax: cfg.LongReplyDelayMax, LongReplyThreshold: cfg.LongReplyThreshold, BurstWindow: cfg.BurstWindow, SpawnStaggerInterval: cfg.SpawnStaggerInterval, PreflightCheckNumber: cfg.PreflightCheckNumber, Google: googleClient, GoogleContactSyncDelay: cfg.GoogleContactSyncDelay, AlertEmailTo: cfg.AlertEmailTo, AlertWebhookToken: cfg.AlertWebhookToken, DocWorkDir: cfg.DocWorkDir}
+	// Gerbang perhatian global: satu slot (kapasitas 1) sebagai mutex FIFO lintas chat.
+	// Aktif hanya bila ATTENTION_QUEUE=true; nil = fitur nonaktif (paralel seperti biasa).
+	if cfg.AttentionQueue {
+		h.AttentionGate = make(chan struct{}, 1)
+		h.AttentionMaxWait = cfg.AttentionMaxWait
+	}
 	admin := &routes.AdminHandler{Store: store, Gateway: h}
 
 	// --- Worker pengingat: kirim tugas terjadwal ke SU saat jatuh tempo ---

@@ -645,6 +645,68 @@ func (s *Store) FindActiveMeetingByPartyAt(ctx context.Context, name string, at 
 	return scanMeetingRow(row)
 }
 
+// FindGroupableSpawnSibling mencari meeting SU-initiated lain (di percakapan BERBEDA) yang
+// bertopik dan berwaktu SAMA PERSIS — kandidat untuk dikonsolidasikan menjadi satu meeting
+// grup.
+func (s *Store) FindGroupableSpawnSibling(ctx context.Context, topic string, at time.Time, excludeConvID string) (*model.MeetingRequest, error) {
+	topic = strings.TrimSpace(topic)
+	if topic == "" {
+		return nil, nil
+	}
+	row := s.pool.QueryRow(ctx, `SELECT `+meetingScanCols+`
+		FROM meeting_requests
+		WHERE requested_via = 'su'
+		  AND status IN ('pending','approved','scheduled')
+		  AND proposed_datetime IS NOT NULL
+		  AND date_trunc('minute', proposed_datetime) = date_trunc('minute', $2::timestamptz)
+		  AND lower(COALESCE(topic,'')) = lower($1)
+		  AND COALESCE(conversation_id,'') <> $3
+		ORDER BY id ASC LIMIT 1`, topic, at.UTC(), excludeConvID)
+	return scanMeetingRow(row)
+}
+
+// AttachMeetingsToGroup menautkan baris meeting (setIDs) ke groupID, lalu MENYELARASKAN
+// groupSize seluruh anggota grup yang masih aktif ke jumlah anggota aktual, dan mereset
+// groupApprovalNotified=false (komposisi grup berubah → gerbang notifikasi grup harus
+// menyala kembali; konsisten dengan DetachMeetingFromGroup).
+func (s *Store) AttachMeetingsToGroup(ctx context.Context, groupID string, setIDs []int64) (int, error) {
+	groupID = strings.TrimSpace(groupID)
+	if groupID == "" || len(setIDs) == 0 {
+		return 0, nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE meeting_requests
+		SET details = jsonb_set(COALESCE(details,'{}'::jsonb), '{groupId}', to_jsonb($1::text)),
+		    updated_at = now()
+		WHERE id = ANY($2::bigint[])`, groupID, setIDs); err != nil {
+		return 0, err
+	}
+	var size int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*) FROM meeting_requests
+		WHERE COALESCE(details->>'groupId','') = $1
+		  AND status IN ('pending','approved','scheduled')`, groupID).Scan(&size); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE meeting_requests
+		SET details = jsonb_set(
+		                jsonb_set(details, '{groupSize}', to_jsonb($2::int)),
+		                '{groupApprovalNotified}', 'false'::jsonb),
+		    updated_at = now()
+		WHERE COALESCE(details->>'groupId','') = $1
+		  AND status IN ('pending','approved','scheduled')`, groupID, size); err != nil {
+		return 0, err
+	}
+	return size, tx.Commit(ctx)
+}
+
 // venuePendingWhere: meeting offline yang menunggu konfirmasi lokasi.
 // Syarat: venueCoordination=true, venueConfirmed!=true, dan status belum terminal.
 const venuePendingWhere = `COALESCE(details->>'venueCoordination','') = 'true'

@@ -1756,6 +1756,41 @@ func (h *Handler) recordSpawnMeeting(ctx context.Context, convID, agentID string
 		return
 	}
 	log.Printf("[SPAWN-MEETING] #%d dibuat (pending, via=su) conv=%s datetime=%v topic=%q", mid, convID, proposed, topic)
+
+	// Konsolidasi lintas-turn: bila balasan ini BUKAN grup batch (groupID kosong) namun
+	// bertopik + berwaktu sama dengan meeting SU-initiated lain di percakapan berbeda,
+	// tautkan keduanya ke satu groupId.
+	if strings.TrimSpace(groupID) == "" && proposed != nil && topic != "" {
+		h.linkSpawnMeetingToSiblingGroup(ctx, mid, convID, topic, *proposed)
+	}
+}
+
+// linkSpawnMeetingToSiblingGroup mencari meeting SU-initiated bertopik+berwaktu sama di
+// percakapan lain dan menautkan meeting baru (newID) ke grup yang sama.
+func (h *Handler) linkSpawnMeetingToSiblingGroup(ctx context.Context, newID int64, convID, topic string, at time.Time) {
+	sibling, err := h.Store.FindGroupableSpawnSibling(ctx, topic, at, convID)
+	if err != nil {
+		log.Printf("[GROUP] cari saudara utk #%d gagal: %v", newID, err)
+		return
+	}
+	if sibling == nil || sibling.ID == newID {
+		return
+	}
+	var sd meetingDetails
+	_ = json.Unmarshal(sibling.Details, &sd)
+	groupID := strings.TrimSpace(sd.GroupID)
+	setIDs := []int64{newID}
+	if groupID == "" {
+		groupID = newGroupID()
+		setIDs = append(setIDs, sibling.ID)
+	}
+	size, err := h.Store.AttachMeetingsToGroup(ctx, groupID, setIDs)
+	if err != nil {
+		log.Printf("[GROUP] tautkan #%d ke grup %s (saudara #%d) gagal: %v", newID, groupID, sibling.ID, err)
+		return
+	}
+	log.Printf("[GROUP] penambahan susulan: #%d ditautkan ke grup %s bersama #%d (size=%d)",
+		newID, groupID, sibling.ID, size)
 }
 
 // notifySpawnFailed memberi tahu SU jika pesan pembuka gagal dikirim.

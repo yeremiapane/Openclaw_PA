@@ -1224,21 +1224,51 @@ func (h *Handler) createMeetingFromApproval(ctx context.Context, convID, agentID
 	}
 }
 
-// persistContactProfile menyimpan email/nama baru dari meeting ke contacts,
-// tanpa menimpa data yang sudah ada.
+
+var contactEmailRe = regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`)
+
+func firstEmailInFacts(facts []string) string {
+	seen := ""
+	for _, f := range facts {
+		for _, m := range contactEmailRe.FindAllString(f, -1) {
+			e := strings.ToLower(strings.TrimSpace(m))
+			if e == "" {
+				continue
+			}
+			if seen == "" {
+				seen = e
+			} else if seen != e {
+				return "" // >1 email berbeda → ambigu
+			}
+		}
+	}
+	return seen
+}
+
+// persistContactProfile menyimpan email/nama baru yang dipelajari dari percakapan ke
+// tabel contacts, tanpa menimpa data yang sudah ada. Sumber email: objek meeting bila
+// ada; jika tidak, diekstrak dari newFacts (kasus kontak memberi email di turn biasa
+// tanpa penjadwalan — dulu email hanya jadi fakta dan TIDAK pernah masuk contacts.email).
 func (h *Handler) persistContactProfile(ctx context.Context, contact *model.Contact, reply *openclaw.AgentReply) {
-	if h.Store == nil || contact == nil || contact.Phone == "" || reply.Meeting == nil {
+	if h.Store == nil || contact == nil || contact.Phone == "" {
 		return
 	}
 	var in db.ContactInput
 	upd := false
 	if contact.Email == "" {
-		if e := strings.TrimSpace(reply.Meeting.AttendeeEmail); e != "" {
-			in.Email = e
+		email := ""
+		if reply.Meeting != nil {
+			email = strings.TrimSpace(reply.Meeting.AttendeeEmail)
+		}
+		if email == "" {
+			email = firstEmailInFacts(reply.NewFacts)
+		}
+		if email != "" {
+			in.Email = email
 			upd = true
 		}
 	}
-	if contact.Name == "" {
+	if contact.Name == "" && reply.Meeting != nil {
 		if n := strings.TrimSpace(reply.Meeting.AttendeeName); n != "" {
 			in.Name = n
 			upd = true
@@ -2878,16 +2908,26 @@ func (h *Handler) confirmVenue(ctx context.Context, contact *model.Contact, a mo
 		err error
 	)
 	wibDate := ""
+	var mdt time.Time
+	haveDT := false
 	if dt := strings.TrimSpace(a.MeetingDatetime); dt != "" {
 		if t, perr := time.Parse(time.RFC3339, dt); perr == nil {
+			mdt = t
+			haveDT = true
 			wibDate = t.In(wibZone).Format("2006-01-02")
 		} else {
 			log.Printf("[VENUE] CONFIRM_VENUE datetime tak valid (%q): %v — pakai fallback", dt, perr)
 		}
 	}
-	if wibDate != "" {
-		m, err = h.Store.FindVenuePendingMeetingByDate(ctx, wibDate)
-	} else {
+	switch {
+	case haveDT:
+		m, err = h.Store.FindVenuePendingMeetingByDatetime(ctx, mdt)
+		if err == nil && m == nil {
+			log.Printf("[VENUE] CONFIRM_VENUE jam %s tak cocok persis meeting mana pun — fallback per-tanggal %s",
+				mdt.In(wibZone).Format("15:04"), wibDate)
+			m, err = h.Store.FindVenuePendingMeetingByDate(ctx, wibDate)
+		}
+	default:
 		m, err = h.Store.FindVenuePendingMeeting(ctx)
 	}
 	if err != nil {

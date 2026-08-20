@@ -674,6 +674,18 @@ func (s *Store) FindVenuePendingMeetingByDate(ctx context.Context, wibDate strin
 	return scanMeetingRow(row)
 }
 
+// FindVenuePendingMeetingByDatetime mencari meeting offline yang menunggu venue dengan
+// proposed_datetime SAMA PERSIS (presisi menit) dengan waktu yang dibawa CONFIRM_VENUE.
+func (s *Store) FindVenuePendingMeetingByDatetime(ctx context.Context, t time.Time) (*model.MeetingRequest, error) {
+	row := s.pool.QueryRow(ctx, `SELECT `+meetingScanCols+`
+		FROM meeting_requests
+		WHERE `+venuePendingWhere+`
+		  AND proposed_datetime IS NOT NULL
+		  AND date_trunc('minute', proposed_datetime) = date_trunc('minute', $1::timestamptz)
+		ORDER BY updated_at DESC, id DESC LIMIT 1`, t.UTC())
+	return scanMeetingRow(row)
+}
+
 // VenueSuggestion = satu lokasi yang pernah dipakai untuk meeting, beserta seberapa sering
 // & alamat terakhir yang tercatat. Dipakai untuk merekomendasikan venue familiar ke Bu Nova.
 type VenueSuggestion struct {

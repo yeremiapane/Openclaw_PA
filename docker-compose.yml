@@ -8,6 +8,8 @@ services:
       - "6379:6379"
     volumes:
       - ./data/redis:/data
+    environment:
+      TZ: Asia/Jakarta
     command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
     restart: unless-stopped
     healthcheck:
@@ -25,6 +27,7 @@ services:
       POSTGRES_DB: pa_ai
       POSTGRES_USER: pa_ai
       POSTGRES_PASSWORD: ${DB_PASS}
+      TZ: Asia/Jakarta
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
     restart: unless-stopped
@@ -44,6 +47,7 @@ services:
     volumes:
       - ./.waha:/app/.sessions
     environment:
+      TZ: Asia/Jakarta
       WAHA_API_KEY: ${WAHA_API_KEY}
       WHATSAPP_DEFAULT_ENGINE: GOWS
       WHATSAPP_HOOK_URL: http://host.docker.internal:4000/webhook/waha

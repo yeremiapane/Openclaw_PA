@@ -17,6 +17,7 @@ services:
     env_file:
       - .env
     environment:
+      TZ: Asia/Jakarta
       GATEWAY_PORT: "4000"
       DB_HOST: postgres
       DB_PORT: "5432"

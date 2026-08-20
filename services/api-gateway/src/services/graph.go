@@ -337,8 +337,8 @@ func (g *GraphClient) CreateEvent(ev CalendarEvent) (*CalendarEventResult, error
 
 	body := graphEventBody{
 		Subject:                    ev.Title,
-		Start:                      graphDateTime{DateTime: startTime.Format(graphFmt), TimeZone: "Asia/Jakarta"},
-		End:                        graphDateTime{DateTime: endTime.Format(graphFmt), TimeZone: "Asia/Jakarta"},
+		Start:                      graphDateTime{DateTime: startTime.In(wibZone).Format(graphFmt), TimeZone: "Asia/Jakarta"},
+		End:                        graphDateTime{DateTime: endTime.In(wibZone).Format(graphFmt), TimeZone: "Asia/Jakarta"},
 		IsReminderOn:               true,
 		ReminderMinutesBeforeStart: ev.ReminderMinutes,
 	}
@@ -407,8 +407,8 @@ func (g *GraphClient) UpdateEvent(eventID string, ev CalendarEvent) (*CalendarEv
 
 	// PATCH parsial: hanya start/end (+ subject & location bila diisi).
 	patch := map[string]any{
-		"start": graphDateTime{DateTime: startTime.Format(graphFmt), TimeZone: "Asia/Jakarta"},
-		"end":   graphDateTime{DateTime: endTime.Format(graphFmt), TimeZone: "Asia/Jakarta"},
+		"start": graphDateTime{DateTime: startTime.In(wibZone).Format(graphFmt), TimeZone: "Asia/Jakarta"},
+		"end":   graphDateTime{DateTime: endTime.In(wibZone).Format(graphFmt), TimeZone: "Asia/Jakarta"},
 	}
 	if ev.Title != "" {
 		patch["subject"] = ev.Title

@@ -19,8 +19,11 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates sudo tini \
+      curl ca-certificates sudo tini tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+ENV TZ=Asia/Jakarta
+RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && echo "${TZ}" > /etc/timezone
 
 RUN useradd -m -s /bin/bash -u 1000 claw \
     && echo "claw ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers

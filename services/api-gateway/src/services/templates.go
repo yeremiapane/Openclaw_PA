@@ -114,13 +114,16 @@ var indonesianMonth = map[time.Month]string{
 	time.December:  "Desember",
 }
 
-// FormatDateIndonesian memformat waktu ke format Indonesia (mis. "Rabu, 25 Juni 2026").
+var wibZone = time.FixedZone("WIB", 7*3600)
+
+
 func FormatDateIndonesian(t time.Time) string {
+	t = t.In(wibZone)
 	return fmt.Sprintf("%s, %d %s %d", indonesianDay[t.Weekday()], t.Day(), indonesianMonth[t.Month()], t.Year())
 }
 
-// FormatTimeRange memformat rentang waktu (mis. "14:00 - 15:00 WIB").
 func FormatTimeRange(start, end time.Time) string {
+	start, end = start.In(wibZone), end.In(wibZone)
 	return fmt.Sprintf("%s - %s WIB", start.Format("15:04"), end.Format("15:04"))
 }
 

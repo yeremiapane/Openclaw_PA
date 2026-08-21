@@ -634,14 +634,19 @@ func (s *Store) FindActiveMeetingByPartyAt(ctx context.Context, name string, at 
 	if name == "" {
 		return nil, nil
 	}
+	// Jendela toleransi ±2 menit: waktu usulan bisa bergeser beberapa detik/menit antar
+	// giliran karena LLM mem-parse ulang waktu relatif ("besok jam 8"). Pencocokan sama-
+	// persis (=) akan meleset dan membuat meeting GANDA. ±2 menit menyerap drift tanpa
+	// keliru menggabung dua meeting berbeda dgn pihak+jam yang sama (praktis mustahil).
 	row := s.pool.QueryRow(ctx, `SELECT `+meetingScanCols+`
 		FROM meeting_requests
 		WHERE status IN ('pending','approved','scheduled')
-		  AND proposed_datetime = $2
+		  AND proposed_datetime BETWEEN $2::timestamptz - interval '2 minutes'
+		                             AND $2::timestamptz + interval '2 minutes'
 		  AND COALESCE(conversation_id,'') <> $3
 		  AND ( lower(COALESCE(external_name,'')) = lower($1)
 		        OR lower(COALESCE(details->>'attendeeName','')) = lower($1) )
-		ORDER BY id ASC LIMIT 1`, name, at, excludeConvID)
+		ORDER BY id ASC LIMIT 1`, name, at.UTC(), excludeConvID)
 	return scanMeetingRow(row)
 }
 
@@ -653,12 +658,15 @@ func (s *Store) FindGroupableSpawnSibling(ctx context.Context, topic string, at 
 	if topic == "" {
 		return nil, nil
 	}
+	// Jendela toleransi ±2 menit (bukan date_trunc lantai-menit yang meleset di batas
+	// menit, mis. 08:00:50 vs 08:01:10).
 	row := s.pool.QueryRow(ctx, `SELECT `+meetingScanCols+`
 		FROM meeting_requests
 		WHERE requested_via = 'su'
 		  AND status IN ('pending','approved','scheduled')
 		  AND proposed_datetime IS NOT NULL
-		  AND date_trunc('minute', proposed_datetime) = date_trunc('minute', $2::timestamptz)
+		  AND proposed_datetime BETWEEN $2::timestamptz - interval '2 minutes'
+		                             AND $2::timestamptz + interval '2 minutes'
 		  AND lower(COALESCE(topic,'')) = lower($1)
 		  AND COALESCE(conversation_id,'') <> $3
 		ORDER BY id ASC LIMIT 1`, topic, at.UTC(), excludeConvID)

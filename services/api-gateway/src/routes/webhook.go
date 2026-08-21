@@ -1088,6 +1088,8 @@ type meetingDetails struct {
 	// GABUNGAN sudah dikirim ke SU — mencegah notifikasi ganda ketika peserta terakhir
 	// menyetujui secara bersamaan (dua percakapan berbeda melintasi ambang serentak).
 	GroupApprovalNotified bool `json:"groupApprovalNotified,omitempty"`
+	// InitiatedBy = nomor SU yang MENGINISIASI meeting ini (SU multi-nomor).
+	InitiatedBy string `json:"initiatedBy,omitempty"`
 }
 
 // createMeetingFromApproval membuat meeting_request (pending) tertaut ke approval
@@ -1735,7 +1737,11 @@ func (h *Handler) spawnOutbound(initiator *model.Contact, act model.Action, srcT
 			ExecutionID: execPtr(execID), ConversationID: convID, ContactID: cidPtr(contact),
 			AgentID: agentID, TargetChat: chatID, Kind: "agent_reply", Text: reply.Response,
 		})
-	h.recordSpawnMeeting(ctx, convID, agentID, contact, act, groupID, groupSize)
+	initiatedBy := ""
+	if initiator != nil {
+		initiatedBy = initiator.Phone
+	}
+	h.recordSpawnMeeting(ctx, convID, agentID, contact, act, groupID, groupSize, initiatedBy)
 }
 
 // spawnMeetingReusable cek apakah meeting pending yang ada boleh dipakai ulang.
@@ -1760,7 +1766,7 @@ func newGroupID() string {
 
 // recordSpawnMeeting membuat (atau memperbarui) baris meeting_requests berstatus
 // 'pending' untuk meeting yang DIINISIASI SU lewat SPAWN_AGENT.
-func (h *Handler) recordSpawnMeeting(ctx context.Context, convID, agentID string, contact *model.Contact, act model.Action, groupID string, groupSize int) {
+func (h *Handler) recordSpawnMeeting(ctx context.Context, convID, agentID string, contact *model.Contact, act model.Action, groupID string, groupSize int, initiatedBy string) {
 	if h.Store == nil {
 		return
 	}
@@ -1806,7 +1812,7 @@ func (h *Handler) recordSpawnMeeting(ctx context.Context, convID, agentID string
 	if contact != nil {
 		name, company, email = contact.Name, contact.Company, contact.Email
 	}
-	det := meetingDetails{Title: topic, AttendeeName: name, AttendeeEmail: email}
+	det := meetingDetails{Title: topic, AttendeeName: name, AttendeeEmail: email, InitiatedBy: strings.TrimSpace(initiatedBy)}
 	// Meeting grup (Fase 1): tandai keanggotaan grup agar konsolidasi (satu approval,
 	// satu koordinasi venue, satu laporan) bisa dilakukan lintas peserta.
 	if strings.TrimSpace(groupID) != "" && groupSize >= 2 {
@@ -3294,6 +3300,14 @@ func (h *Handler) presentTimeApprovalToSU(ctx context.Context, meetingID int64) 
 	h.notifySUTimeApproval(ctx, m, ed, apID)
 }
 
+// suApprovalTarget mengembalikan nomor SU tujuan notifikasi approval.
+func (h *Handler) suApprovalTarget(det meetingDetails) string {
+	if p := adminNormalizePhone(det.InitiatedBy); p != "" && phoneMatchesAny(p, h.SUPhone, h.SUPhones) {
+		return p
+	}
+	return h.SUPhone
+}
+
 // notifySUTimeApproval mengirim ringkasan WAKTU (siapa + waktu + topik) ke SU untuk
 // persetujuan tahap pertama meeting offline. Belum ada lokasi (venue dikoordinasikan
 // setelah SU setuju). TIDAK menampilkan biaya/estimasi harga (kebijakan).
@@ -3301,6 +3315,7 @@ func (h *Handler) notifySUTimeApproval(ctx context.Context, m *model.MeetingRequ
 	if h.SUPhone == "" {
 		return
 	}
+	suTarget := h.suApprovalTarget(ed)
 	who := firstNonEmptyStr(ed.AttendeeName, m.ExternalName, "Pihak eksternal")
 	if c := strings.TrimSpace(m.ExternalCompany); c != "" {
 		who += " (" + c + ")"
@@ -3326,9 +3341,9 @@ func (h *Handler) notifySUTimeApproval(ctx context.Context, m *model.MeetingRequ
 		"%s\n\nBalas *SETUJU* untuk menyetujui waktu, atau *TOLAK* untuk batal.",
 		header, who, when, title, coordNote)
 	ap := apID
-	h.sendAndRecord(ctx, func() error { return h.Waha.SendText(h.SUPhone, body) },
+	h.sendAndRecord(ctx, func() error { return h.Waha.SendText(suTarget, body) },
 		model.OutboundMessage{
-			ConversationID: m.ConversationID, ContactID: m.ContactID, TargetChat: h.SUPhone,
+			ConversationID: m.ConversationID, ContactID: m.ContactID, TargetChat: suTarget,
 			Kind: "approval_notify", Text: body, ApprovalID: &ap,
 		})
 }
@@ -3508,12 +3523,15 @@ func (h *Handler) notifySUApproval(ctx context.Context, convID string, id int64,
 	}
 	// Untuk RESCHEDULE: sertakan rekomendasi slot kosong kalender Pak Sudianto pada
 	// hari yang diusulkan, agar beliau bisa langsung menilai/menawarkan alternatif.
+	// Sekaligus resolve nomor SU tujuan dari inisiator meeting (SU multi-nomor).
 	slotNote := ""
+	suTarget := h.SUPhone
 	if reply.Meeting != nil {
-		if mr, merr := h.Store.MeetingByApproval(ctx, id); merr == nil && mr != nil && mr.ProposedDatetime != nil {
+		if mr, merr := h.Store.MeetingByApproval(ctx, id); merr == nil && mr != nil {
 			var md meetingDetails
 			_ = json.Unmarshal(mr.Details, &md)
-			if strings.TrimSpace(md.RescheduleFrom) != "" {
+			suTarget = h.suApprovalTarget(md)
+			if mr.ProposedDatetime != nil && strings.TrimSpace(md.RescheduleFrom) != "" {
 				dur := md.DurationMinutes
 				if dur <= 0 {
 					dur = 60
@@ -3526,9 +3544,9 @@ func (h *Handler) notifySUApproval(ctx context.Context, convID string, id int64,
 	msg := fmt.Sprintf("%s \n%s%s\nBalas *SETUJU* untuk konfirmasi, atau *TOLAK* untuk batal.",
 		header, body, slotNote)
 	apID := id
-	h.sendAndRecord(ctx, func() error { return h.Waha.SendText(h.SUPhone, msg) },
+	h.sendAndRecord(ctx, func() error { return h.Waha.SendText(suTarget, msg) },
 		model.OutboundMessage{
-			ConversationID: convID, ContactID: cidPtr(contact), TargetChat: h.SUPhone,
+			ConversationID: convID, ContactID: cidPtr(contact), TargetChat: suTarget,
 			Kind: "approval_notify", Text: msg, ApprovalID: &apID,
 		})
 }
@@ -3625,6 +3643,7 @@ func (h *Handler) notifySUGroupApproval(ctx context.Context, groupID string, pri
 	}
 	offline := false
 	topic := ""
+	initiatedBy := ""
 	var lines []string
 	for i, m := range meetings {
 		var d meetingDetails
@@ -3634,6 +3653,9 @@ func (h *Handler) notifySUGroupApproval(ctx context.Context, groupID string, pri
 		}
 		if topic == "" {
 			topic = firstNonEmptyStr(d.Title, m.Topic)
+		}
+		if initiatedBy == "" {
+			initiatedBy = strings.TrimSpace(d.InitiatedBy)
 		}
 		who := firstNonEmptyStr(d.AttendeeName, m.ExternalName, "Peserta")
 		if c := strings.TrimSpace(m.ExternalCompany); c != "" {
@@ -3682,12 +3704,13 @@ func (h *Handler) notifySUGroupApproval(ctx context.Context, groupID string, pri
 	if len(meetings) > 0 {
 		convID = meetings[0].ConversationID
 	}
-	h.sendAndRecord(ctx, func() error { return h.Waha.SendText(h.SUPhone, body) },
+	suTarget := h.suApprovalTarget(meetingDetails{InitiatedBy: initiatedBy})
+	h.sendAndRecord(ctx, func() error { return h.Waha.SendText(suTarget, body) },
 		model.OutboundMessage{
-			ConversationID: convID, TargetChat: h.SUPhone,
+			ConversationID: convID, TargetChat: suTarget,
 			Kind: "approval_notify", Text: body, ApprovalID: &ap,
 		})
-	log.Printf("[GROUP] notifikasi gabungan grup %s (%d peserta) terkirim ke SU (primary approval #%d)", groupID, len(meetings), primaryApprovalID)
+	log.Printf("[GROUP] notifikasi gabungan grup %s (%d peserta) terkirim ke SU %s (primary approval #%d)", groupID, len(meetings), suTarget, primaryApprovalID)
 }
 
 // notifySUGroupDivergence melaporkan ke SU 

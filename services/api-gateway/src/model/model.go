@@ -414,6 +414,17 @@ type Action struct {
 	Limit    int    `json:"limit,omitempty"`
 
 	Trust string `json:"trust,omitempty"`
+
+	// ─── Verb ADMIN (hanya dari agent admin, trust=="admin") ─────────
+	// ADMIN_FETCH: Resource (contacts/executions/usage/approvals/meetings/agents/health/
+	//   external/outbound/reminders/watches/conversation) + Limit; untuk conversation,
+	//   Target = nomor kontak atau id percakapan (agent:<tipe>:<nomor>).
+	// ADMIN_APPROVE / ADMIN_REJECT: ApprovalID approval yang menunggu.
+	// ADMIN_BLOCK_EXTERNAL / ADMIN_PROMOTE_EXTERNAL: Target = nomor kontak external.
+	// ADMIN_RESEND_RSVP: MeetingID meeting terjadwal.
+	// Untuk verb destruktif (approve/reject/block/promote), Confirm=true menandai Admin
+	// SUDAH mengonfirmasi. Tanpa Confirm, gateway hanya meminta konfirmasi & TIDAK mengeksekusi.
+	Confirm bool `json:"confirm,omitempty"`
 }
 
 // Approval = satu pesan keluar yang ditahan menunggu persetujuan Pak Sudianto

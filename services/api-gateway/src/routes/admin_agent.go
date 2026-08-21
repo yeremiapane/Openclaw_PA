@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"pa-ai/api-gateway/src/db"
 	"pa-ai/api-gateway/src/model"
 	"pa-ai/api-gateway/src/openclaw"
 )
@@ -128,11 +129,14 @@ func (h *Handler) adminFetch(initiator *model.Contact, a model.Action) {
 
 	resource := strings.ToLower(strings.TrimSpace(a.Resource))
 	limit := a.Limit
-	if limit <= 0 || limit > 50 {
+	if limit <= 0 {
 		limit = 20
 	}
+	if limit > 100 {
+		limit = 100
+	}
 
-	body, err := h.adminFetchResource(ctx, resource, limit)
+	body, err := h.adminFetchResource(ctx, resource, strings.TrimSpace(a.Target), limit)
 	if err != nil {
 		log.Printf("[ADMIN-FETCH] resource=%q gagal: %v", resource, err)
 		instr := "[HASIL TARIK DATA — giliran sistem, BUKAN pesan dari Admin]\n" +
@@ -151,11 +155,95 @@ func (h *Handler) adminFetch(initiator *model.Contact, a model.Action) {
 	h.pushToAdmin(ctx, instr.String())
 }
 
-func (h *Handler) adminFetchResource(ctx context.Context, resource string, limit int) (string, error) {
+func (h *Handler) adminFetchResource(ctx context.Context, resource, target string, limit int) (string, error) {
 	if h.Store == nil {
 		return "", errors.New("store tidak tersedia")
 	}
 	switch resource {
+	case "external", "eksternal":
+		exts, err := h.Store.ListExternalContacts(ctx, "", limit)
+		if err != nil {
+			return "", err
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "Kontak external (belum whitelist): %d\n", len(exts))
+		for _, e := range exts {
+			name := e.DisplayName
+			if name == "" {
+				name = "(tanpa nama)"
+			}
+			fmt.Fprintf(&b, "- %s | %s | status=%s | pesan=%d | risk=%d\n",
+				name, e.Identifier, e.Status, e.MessageCount, e.RiskScore)
+		}
+		return b.String(), nil
+
+	case "outbound", "keluar":
+		outs, err := h.Store.ListOutbound(ctx, "", limit)
+		if err != nil {
+			return "", err
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "Pesan keluar terakhir: %d\n", len(outs))
+		for _, o := range outs {
+			ts := o.CreatedAt.In(wibZone).Format("02 Jan 15:04")
+			fmt.Fprintf(&b, "- [%s] agent=%s → %s status=%s kind=%s | %s\n",
+				ts, o.AgentID, o.TargetChat, o.Status, o.Kind, oneLine(o.Text, 70))
+		}
+		return b.String(), nil
+
+	case "reminders", "pengingat", "scheduled", "tugas":
+		tasks, err := h.Store.ListActiveTasks(ctx, "su", limit)
+		if err != nil {
+			return "", err
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "Tugas/pengingat aktif (created_by=su): %d\n", len(tasks))
+		for _, t := range tasks {
+			ts := t.FireAt.In(wibZone).Format("02 Jan 15:04")
+			recur := ""
+			if t.RecurKind != "" && t.RecurKind != "none" {
+				recur = " [" + t.RecurKind + "]"
+			}
+			fmt.Fprintf(&b, "- #%d [%s]%s kind=%s | %s\n", t.ID, ts, recur, t.Kind, oneLine(t.Note, 70))
+		}
+		return b.String(), nil
+
+	case "watches", "pantauan", "email_watch":
+		watches, err := h.Store.ListActiveEmailWatches(ctx, "su", limit)
+		if err != nil {
+			return "", err
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "Pantauan email aktif (created_by=su): %d\n", len(watches))
+		for _, w := range watches {
+			fmt.Fprintf(&b, "- #%d status=%s | %s\n", w.ID, w.Status, oneLine(w.Criteria, 80))
+		}
+		return b.String(), nil
+
+	case "conversation", "percakapan", "chat", "riwayat":
+		convID, err := h.resolveConvIDForAdmin(ctx, target, "")
+		if err != nil {
+			return "", err
+		}
+		msgs, err := h.Store.RecentMessages(ctx, convID, limit)
+		if err != nil {
+			return "", err
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "Percakapan %s — %d turn terakhir (kronologis, terlama→terbaru):\n", convID, len(msgs))
+		if len(msgs) == 0 {
+			b.WriteString("(belum ada pesan tercatat untuk percakapan ini)\n")
+		}
+		for _, m := range msgs {
+			ts := m.CreatedAt.In(wibZone).Format("02 Jan 15:04")
+			who := m.Role
+			if m.AgentID != "" {
+				who += "/" + m.AgentID
+			}
+			fmt.Fprintf(&b, "- [%s] %s: %s\n", ts, who, oneLine(m.Text, 200))
+		}
+		return b.String(), nil
+
 	case "contacts", "kontak":
 		contacts, err := h.Store.ListContacts(ctx, false)
 		if err != nil {
@@ -251,8 +339,34 @@ func (h *Handler) adminFetchResource(ctx context.Context, resource string, limit
 		return b.String(), nil
 
 	default:
-		return "", fmt.Errorf("resource tidak dikenal: %q (pilihan: contacts, executions, usage, approvals, meetings, agents, health)", resource)
+		return "", fmt.Errorf("resource tidak dikenal: %q (pilihan: contacts, executions, usage, approvals, "+
+			"meetings, agents, health, external, outbound, reminders, watches, conversation)", resource)
 	}
+}
+
+// resolveConvIDForAdmin memetakan rujukan Admin (nomor kontak ATAU id percakapan penuh
+// "agent:<tipe>:<nomor>") menjadi conversation_id.
+func (h *Handler) resolveConvIDForAdmin(ctx context.Context, target, agentOverride string) (string, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", errors.New("sebutkan percakapan: nomor kontak atau id percakapan (agent:<tipe>:<nomor>)")
+	}
+	if strings.HasPrefix(target, "agent:") {
+		return target, nil
+	}
+	phone := adminNormalizePhone(target)
+	if phone == "" {
+		return "", fmt.Errorf("target %q tidak dikenali sebagai nomor/percakapan", target)
+	}
+	agent := strings.ToLower(strings.TrimSpace(agentOverride))
+	if agent == "" {
+		if c, err := h.Store.FindContact(ctx, model.Identifier{Kind: "phone", Value: phone}); err == nil && c != nil && c.ID > 0 {
+			agent = agentForTrust(c.TrustLevel)
+		} else {
+			agent = "pa_communicator" // default: kontak eksternal
+		}
+	}
+	return "agent:" + agent + ":" + phone, nil
 }
 
 // pushToAdmin menyusun & mengirim satu pesan ke agent admin (giliran sistem), dengan
@@ -500,6 +614,145 @@ func (h *Handler) adminRestartAgent(initiator *model.Contact, a model.Action) {
 	h.pushToAdmin(ctx, hdr+"Sesi agent "+target+" (untuk "+phone+") sudah di-restart bersih. "+
 		"Giliran berikutnya mulai dari sesi baru. Data Postgres (kontak, meeting, memori fakta) TIDAK terpengaruh. "+
 		"Sampaikan ke Admin bahwa restart berhasil.")
+}
+
+// adminIsAuthorized menegakkan gerbang trust=="admin" untuk semua verb tulis admin.
+// Mengembalikan false (dan mencatat penolakan) bila inisiator bukan admin.
+func adminIsAuthorized(initiator *model.Contact, tag string, a model.Action) bool {
+	if initiator != nil && initiator.TrustLevel == "admin" {
+		return true
+	}
+	trust := "(nil)"
+	if initiator != nil {
+		trust = initiator.TrustLevel
+	}
+	log.Printf("[%s] DITOLAK: inisiator non-admin (trust=%s) type=%s target=%s", tag, trust, a.Type, a.Target)
+	return false
+}
+
+// adminConfirmNeeded mendorong permintaan konfirmasi ke Admin dan mengembalikan true bila
+// aksi destruktif BELUM dikonfirmasi (Confirm != true). Pemanggil WAJIB berhenti bila true.
+// Ini gerbang dua-fase: gateway menolak mengeksekusi tanpa Confirm eksplisit.
+func (h *Handler) adminConfirmNeeded(ctx context.Context, confirmed bool, summary string) bool {
+	if confirmed {
+		return false
+	}
+	h.pushToAdmin(ctx, "[KONFIRMASI DIPERLUKAN — giliran sistem, BUKAN pesan dari Admin]\n"+
+		summary+"\n\nIni aksi yang berdampak. Sampaikan ringkas ke Admin lalu MINTA konfirmasi eksplisit "+
+		"(mis. \"ya, lanjutkan\"). Hanya setelah Admin setuju, jalankan verb yang SAMA dengan confirm=true. "+
+		"Bila Admin membatalkan / ragu, JANGAN jalankan.")
+	return true
+}
+
+// adminDecideApproval menjalankan ADMIN_APPROVE / ADMIN_REJECT: memutuskan satu approval
+// yang menunggu.
+func (h *Handler) adminDecideApproval(initiator *model.Contact, a model.Action) {
+	if !adminIsAuthorized(initiator, "ADMIN-APPROVAL", a) {
+		return
+	}
+	ctx := context.Background()
+	const hdr = "[HASIL KEPUTUSAN APPROVAL — giliran sistem, BUKAN pesan dari Admin]\n"
+	approve := strings.EqualFold(strings.TrimSpace(a.Type), "ADMIN_APPROVE")
+	if a.ApprovalID <= 0 {
+		h.pushToAdmin(ctx, hdr+"Gagal: approvalId kosong. Sebutkan approval mana (lihat ADMIN_FETCH resource=approvals).")
+		return
+	}
+	ap, err := h.Store.GetApproval(ctx, a.ApprovalID)
+	if err != nil || ap == nil {
+		h.pushToAdmin(ctx, hdr+fmt.Sprintf("Approval #%d tidak ditemukan.", a.ApprovalID))
+		return
+	}
+	if ap.Status != "pending" {
+		h.pushToAdmin(ctx, hdr+fmt.Sprintf("Approval #%d sudah berstatus %q — tidak bisa diputuskan lagi.", a.ApprovalID, ap.Status))
+		return
+	}
+	verb := "MENOLAK"
+	if approve {
+		verb = "MENYETUJUI"
+	}
+	summary := fmt.Sprintf("Anda akan %s approval #%d → pesan ke %s:\n\"%s\"",
+		verb, ap.ID, ap.TargetChat, oneLine(ap.ResponseText, 200))
+	if h.adminConfirmNeeded(ctx, a.Confirm, summary) {
+		return
+	}
+	msg, err := h.DecideApproval(ctx, a.ApprovalID, approve)
+	if err != nil {
+		log.Printf("[ADMIN-APPROVAL] #%d approve=%v gagal: %v", a.ApprovalID, approve, err)
+		h.pushToAdmin(ctx, hdr+fmt.Sprintf("Keputusan approval #%d gagal: %v", a.ApprovalID, err))
+		return
+	}
+	log.Printf("[ADMIN-APPROVAL] admin memutuskan approval #%d approve=%v: %s", a.ApprovalID, approve, oneLine(msg, 80))
+	h.pushToAdmin(ctx, hdr+fmt.Sprintf("Approval #%d diproses. Hasil: %s\nSampaikan ringkas ke Admin.", a.ApprovalID, msg))
+}
+
+// adminModerateExternal menjalankan ADMIN_BLOCK_EXTERNAL / ADMIN_PROMOTE_EXTERNAL:
+// memblokir atau mempromosikan kontak external ke whitelist. Mengubah batas kepercayaan →
+// wajib Confirm=true.
+func (h *Handler) adminModerateExternal(initiator *model.Contact, a model.Action) {
+	if !adminIsAuthorized(initiator, "ADMIN-EXTERNAL", a) {
+		return
+	}
+	ctx := context.Background()
+	const hdr = "[HASIL MODERASI EXTERNAL — giliran sistem, BUKAN pesan dari Admin]\n"
+	block := strings.EqualFold(strings.TrimSpace(a.Type), "ADMIN_BLOCK_EXTERNAL")
+	phone := adminNormalizePhone(a.Target)
+	if phone == "" {
+		h.pushToAdmin(ctx, hdr+"Gagal: target (nomor kontak external) kosong/invalid.")
+		return
+	}
+	action := "MEMPROMOSIKAN ke whitelist"
+	if block {
+		action = "MEMBLOKIR"
+	}
+	if h.adminConfirmNeeded(ctx, a.Confirm, fmt.Sprintf("Anda akan %s kontak external %s.", action, phone)) {
+		return
+	}
+	if block {
+		blocked, err := h.Store.BlockContactByPhone(ctx, phone, "diblokir via agent admin")
+		if err != nil {
+			log.Printf("[ADMIN-EXTERNAL] block %s gagal: %v", phone, err)
+			h.pushToAdmin(ctx, hdr+fmt.Sprintf("Blokir %s gagal: %v", phone, err))
+			return
+		}
+		log.Printf("[ADMIN-EXTERNAL] admin memblokir %s → %v", phone, blocked)
+		h.pushToAdmin(ctx, hdr+fmt.Sprintf("Kontak %s diblokir (identifier: %s). Sampaikan ke Admin.",
+			phone, strings.Join(blocked, ", ")))
+		return
+	}
+	trust := strings.TrimSpace(a.Trust)
+	if trust == "" {
+		trust = "external"
+	}
+	c, err := h.Store.PromoteExternal(ctx, phone+"@c.us", db.ContactInput{Phone: phone, TrustLevel: trust})
+	if err != nil {
+		log.Printf("[ADMIN-EXTERNAL] promote %s gagal: %v", phone, err)
+		h.pushToAdmin(ctx, hdr+fmt.Sprintf("Promosi %s gagal: %v (kontak external mungkin hanya ber-identifier @lid — sebutkan nomor yang benar).", phone, err))
+		return
+	}
+	log.Printf("[ADMIN-EXTERNAL] admin mempromosikan %s → whitelist trust=%s (id=%d)", phone, c.TrustLevel, c.ID)
+	h.pushToAdmin(ctx, hdr+fmt.Sprintf("Kontak %s dipromosikan ke whitelist (trust=%s). Sampaikan ke Admin.",
+		phone, c.TrustLevel))
+}
+
+// adminResendRSVP menjalankan ADMIN_RESEND_RSVP: kirim ulang undangan RSVP meeting
+// terjadwal (pemulihan email gagal). Idempoten & non-destruktif → tanpa konfirmasi.
+func (h *Handler) adminResendRSVP(initiator *model.Contact, a model.Action) {
+	if !adminIsAuthorized(initiator, "ADMIN-RESEND", a) {
+		return
+	}
+	ctx := context.Background()
+	const hdr = "[HASIL RESEND UNDANGAN — giliran sistem, BUKAN pesan dari Admin]\n"
+	if a.MeetingID <= 0 {
+		h.pushToAdmin(ctx, hdr+"Gagal: meetingId kosong. Sebutkan meeting mana (lihat ADMIN_FETCH resource=meetings).")
+		return
+	}
+	if err := h.ResendMeetingRSVP(ctx, a.MeetingID); err != nil {
+		log.Printf("[ADMIN-RESEND] meeting #%d gagal: %v", a.MeetingID, err)
+		h.pushToAdmin(ctx, hdr+fmt.Sprintf("Kirim ulang undangan meeting #%d gagal: %v", a.MeetingID, err))
+		return
+	}
+	log.Printf("[ADMIN-RESEND] admin kirim ulang undangan meeting #%d", a.MeetingID)
+	h.pushToAdmin(ctx, hdr+fmt.Sprintf("Undangan meeting #%d dikirim ulang. Sampaikan ke Admin.", a.MeetingID))
 }
 
 // oneLine memampatkan teks jadi satu baris dan memotong pada n rune.

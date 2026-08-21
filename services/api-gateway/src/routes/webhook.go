@@ -1490,6 +1490,21 @@ func (h *Handler) applyActions(ctx context.Context, convID string, contact *mode
 			// mungkin terkontaminasi.
 			act := a
 			go h.adminRestartAgent(contact, act)
+		case "ADMIN_APPROVE", "ADMIN_REJECT":
+			// Admin (lewat agent admin) menyetujui/menolak satu approval yang menunggu.
+			// Aksi destruktif (approve = lepas pesan ke eksternal) → wajib Confirm=true.
+			act := a
+			go h.adminDecideApproval(contact, act)
+		case "ADMIN_BLOCK_EXTERNAL", "ADMIN_PROMOTE_EXTERNAL":
+			// Admin (lewat agent admin) memblokir / mempromosikan kontak external.
+			// Mengubah batas kepercayaan → wajib Confirm=true.
+			act := a
+			go h.adminModerateExternal(contact, act)
+		case "ADMIN_RESEND_RSVP":
+			// Admin (lewat agent admin) mengirim ulang undangan RSVP meeting terjadwal
+			// (pemulihan email gagal). Idempoten & non-destruktif → tanpa konfirmasi.
+			act := a
+			go h.adminResendRSVP(contact, act)
 		default:
 			if a.Type != "" {
 				log.Printf("[ACTION] tipe tidak dikenal: %q (diabaikan)", a.Type)

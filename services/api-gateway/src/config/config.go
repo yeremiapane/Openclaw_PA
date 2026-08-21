@@ -52,13 +52,27 @@ type Config struct {
 	AlertEmailTo      string // tujuan notifikasi alert keamanan/kesehatan
 	AlertWebhookToken string // Bearer token untuk POST /internal/alerts (kosong = endpoint nonaktif)
 
-	// Kontak trusted untuk seed whitelist
-	SUPhone   string
-	SULid     string
-	NovaPhone string
-	NovaLid   string
-	AdminPhone string
-	AdminLid   string
+	// Kontak trusted untuk seed whitelist.
+	//
+	// Tiap peran mendukung BEBERAPA nomor dalam satu env var, dipisah koma (,) atau
+	// titik-koma (;). Pemisahan peran:
+	//   - *Phone  (tunggal) = PRIMARY = entri pertama = tujuan SEMUA kirim proaktif
+	//     (approval, reminder, notifikasi). Dijaga satu agar tak ada balapan/dobel.
+	//   - *Phones (daftar)  = SEMUA nomor peran itu — dikenali penuh saat INBOUND
+	//     (di-seed sbg kontak dengan trust peran; routing 100% via trust_level).
+	// LID opsional & selaras-indeks dengan Phone (LID ke-i milik Phone ke-i).
+	SUPhone    string
+	SUPhones   []string
+	SULid      string
+	SULids     []string
+	NovaPhone  string
+	NovaPhones []string
+	NovaLid    string
+	NovaLids   []string
+	AdminPhone  string
+	AdminPhones []string
+	AdminLid    string
+	AdminLids   []string
 
 	// Pengingat : menit sebelum meeting mulai untuk pengingat otomatis.
 	ReminderLeadMinutes int
@@ -129,6 +143,15 @@ func Load() Config {
 		}
 	}
 
+	// Nomor peran mendukung banyak entri (dipisah , atau ;). Entri pertama = primary.
+	// LID selaras-indeks dengan Phone (LID ke-i untuk Phone ke-i).
+	suPhones := splitList(getenv("SU_PHONE", ""))
+	suLids := splitList(getenv("SU_LID", ""))
+	novaPhones := splitList(getenv("NOVA_PHONE", ""))
+	novaLids := splitList(getenv("NOVA_LID", ""))
+	adminPhones := splitList(getenv("ADMIN_PHONE", ""))
+	adminLids := splitList(getenv("ADMIN_LID", ""))
+
 	cfg := Config{
 		Port:        getenv("GATEWAY_PORT", "4000"),
 		WahaURL:     getenv("WAHA_URL", "http://localhost:13000"),
@@ -158,12 +181,18 @@ func Load() Config {
 		AlertEmailTo:      getenv("ALERT_EMAIL_TO", "yeremia.yosefan@hypernet.co.id"),
 		AlertWebhookToken: getenv("ALERT_WEBHOOK_TOKEN", ""),
 
-		SUPhone:    getenv("SU_PHONE", ""),
-		SULid:      getenv("SU_LID", ""),
-		NovaPhone:  getenv("NOVA_PHONE", ""),
-		NovaLid:    getenv("NOVA_LID", ""),
-		AdminPhone: getenv("ADMIN_PHONE", ""),
-		AdminLid:   getenv("ADMIN_LID", ""),
+		SUPhone:    first(suPhones),
+		SUPhones:   suPhones,
+		SULid:      first(suLids),
+		SULids:     suLids,
+		NovaPhone:  first(novaPhones),
+		NovaPhones: novaPhones,
+		NovaLid:    first(novaLids),
+		NovaLids:   novaLids,
+		AdminPhone:  first(adminPhones),
+		AdminPhones: adminPhones,
+		AdminLid:    first(adminLids),
+		AdminLids:   adminLids,
 
 		ReminderLeadMinutes: getenvInt("MEETING_REMINDER_LEAD_MIN", 15),
 
@@ -349,6 +378,33 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// splitList memecah nilai yang dipisah koma (,) atau titik-koma (;) menjadi daftar
+// entri terpangkas — membuang yang kosong & duplikat, mempertahankan urutan. Entri
+// pertama diperlakukan sebagai "primary" oleh pemanggil. Dipakai agar SU/admin/support
+// bisa punya beberapa nomor dalam satu env var tanpa memecah variabel.
+func splitList(s string) []string {
+	fields := strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ';' })
+	seen := make(map[string]bool, len(fields))
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		f = strings.TrimSpace(f)
+		if f == "" || seen[f] {
+			continue
+		}
+		seen[f] = true
+		out = append(out, f)
+	}
+	return out
+}
+
+// first mengembalikan entri pertama daftar (primary) atau "" bila kosong.
+func first(list []string) string {
+	if len(list) > 0 {
+		return list[0]
+	}
+	return ""
 }
 
 func getenvBool(key string, fallback bool) bool {

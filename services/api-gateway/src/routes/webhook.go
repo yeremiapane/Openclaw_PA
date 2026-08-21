@@ -35,11 +35,16 @@ type Handler struct {
 	OpenClaw  *openclaw.Client
 	Memory    *memory.Service
 	Services  *services.Client // Calendar + Email (penjadwalan saat approve)
-	SUPhone   string           // nomor Pak Sudianto — tujuan notifikasi approval & orchestrator
+	SUPhone   string           // nomor Pak Sudianto PRIMARY — tujuan notifikasi approval & orchestrator
 	NovaPhone string
-	// AdminPhone = nomor agent admin (trust=admin). Tujuan push hasil ADMIN_FETCH &
+	// AdminPhone = nomor agent admin PRIMARY (trust=admin). Tujuan push hasil ADMIN_FETCH &
 	// jangkar sesi agent admin. Terpisah dari SU. Kosong = agent admin nonaktif.
 	AdminPhone string
+	// SUPhones/AdminPhones = SEMUA nomor peran (primary + tambahan). Dipakai HANYA untuk
+	// cek keanggotaan (mis. proteksi kontak agar admin tak menghapus nomor SU/admin);
+	// kirim proaktif tetap ke *Phone primary agar tak ada balapan/dobel.
+	SUPhones    []string
+	AdminPhones []string
 	// ReminderLeadMinutes = berapa menit sebelum meeting mulai pengingat otomatis
 	// dikirim ke SU (default 15 bila <= 0).
 	ReminderLeadMinutes int
@@ -373,7 +378,7 @@ func (h *Handler) process(contact *model.Contact, agentID, convID, from, text, r
 
 	// Simpan profil yang BARU dipelajari (email/nama) ke tabel contacts agar diingat
 	// lintas-percakapan — sehingga bot tak menanyakan ulang data yang sudah diberikan.
-	h.persistContactProfile(ctx, contact, reply)
+	h.persistContactProfile(ctx, convID, contact, reply)
 
 	// Approval gate: pesan yang mengikat Pak Sudianto ditahan sampai beliau
 	// menyetujui. Memori turn ini ditunda hingga approve (lihat handleApprovalCommand).
@@ -1249,7 +1254,7 @@ func firstEmailInFacts(facts []string) string {
 // tabel contacts, tanpa menimpa data yang sudah ada. Sumber email: objek meeting bila
 // ada; jika tidak, diekstrak dari newFacts (kasus kontak memberi email di turn biasa
 // tanpa penjadwalan — dulu email hanya jadi fakta dan TIDAK pernah masuk contacts.email).
-func (h *Handler) persistContactProfile(ctx context.Context, contact *model.Contact, reply *openclaw.AgentReply) {
+func (h *Handler) persistContactProfile(ctx context.Context, convID string, contact *model.Contact, reply *openclaw.AgentReply) {
 	if h.Store == nil || contact == nil || contact.Phone == "" {
 		return
 	}
@@ -1282,6 +1287,61 @@ func (h *Handler) persistContactProfile(ctx context.Context, contact *model.Cont
 		return
 	}
 	log.Printf("[PROFILE] kontak %s diperbarui dari percakapan (email/nama)", contact.Phone)
+
+	// Bila email BARU saja diketahui, tutup celah "email datang setelah finalisasi":
+	// meeting SU-initiated bisa sudah scheduled tanpa undangan terkirim (AttendeeEmail
+	// kosong saat venue dikonfirmasi). Kirim undangan sekarang setelah email tercatat.
+	if in.Email != "" {
+		h.completePendingInvitation(ctx, convID, in.Email)
+	}
+}
+
+// completePendingInvitation menutup celah urutan: undangan meeting memakai
+// det.AttendeeEmail (JSON details), bukan contacts.email. Bila kontak memberi email
+// SETELAH meeting difinalisasi (venue dikonfirmasi lebih dulu, email menyusul), undangan
+// tak pernah terkirim. Fungsi ini mencari meeting scheduled pada percakapan ini yang
+// belum punya AttendeeEmail, mem-backfill email, lalu mengirim RSVP + .ics. Hanya untuk
+// meeting SU-initiated (non-external); meeting yang diinisiasi eksternal → pihak eksternal
+// yang mengirim undangan ke pa@hypernet.co.id, jadi dilewati.
+func (h *Handler) completePendingInvitation(ctx context.Context, convID, email string) {
+	if h.Services == nil || !h.Services.Enabled() || strings.TrimSpace(convID) == "" || strings.TrimSpace(email) == "" {
+		return
+	}
+	m, err := h.Store.ActiveMeetingByConversation(ctx, convID)
+	if err != nil || m == nil || m.Status != "scheduled" {
+		return
+	}
+	if m.RequestedVia == "external" {
+		return // pihak eksternal yang mengirim undangan/link
+	}
+	var det meetingDetails
+	_ = json.Unmarshal(m.Details, &det)
+	if strings.TrimSpace(det.AttendeeEmail) != "" {
+		return // sudah punya email → undangan sudah tertangani saat finalisasi
+	}
+	title := firstNonEmptyStr(det.Title, m.Topic, "Meeting")
+	duration := det.DurationMinutes
+	if duration <= 0 {
+		duration = 60
+	}
+	dt := ""
+	if m.ProposedDatetime != nil {
+		dt = m.ProposedDatetime.Format(time.RFC3339)
+	}
+	if err := h.Services.SendRSVP(ctx, services.RSVPReq{
+		To: email, ToName: firstNonEmptyStr(det.AttendeeName, m.ExternalName, email),
+		Title: title, Datetime: dt, DurationMinutes: duration, Venue: m.Venue,
+		CalendarLink: det.CalendarLink, TeamsLink: det.TeamsLink,
+	}); err != nil {
+		log.Printf("[INVITE-BACKFILL] meeting #%d kirim RSVP ke %s gagal: %v", m.ID, email, err)
+		return
+	}
+	det.AttendeeEmail = email
+	newDetails, _ := json.Marshal(det)
+	if err := h.Store.ScheduleMeeting(ctx, m.ID, newDetails, "su", "email peserta diterima setelah finalisasi — undangan dikirim"); err != nil {
+		log.Printf("[INVITE-BACKFILL] simpan email meeting #%d gagal: %v", m.ID, err)
+	}
+	log.Printf("[INVITE-BACKFILL] meeting #%d: email %s di-backfill, undangan RSVP terkirim", m.ID, email)
 }
 
 // firstNonEmptyStr mengembalikan string non-kosong pertama.
@@ -4063,6 +4123,16 @@ func (h *Handler) createEventAndInvite(ctx context.Context, m *model.MeetingRequ
 		}
 	}
 
+	// Fallback email peserta: bila undangan (det.AttendeeEmail) belum terisi tapi email
+	// sudah tercatat di kontak (mis. kontak memberi email SEBELUM venue dikonfirmasi),
+	// ambil dari contacts agar undangan tetap terkirim. Hanya solo & non-eksternal.
+	if !isGroup && !externalHosted && strings.TrimSpace(det.AttendeeEmail) == "" && m.ContactID != nil {
+		if c, err := h.Store.ContactByID(ctx, int64(*m.ContactID)); err == nil && c != nil && strings.TrimSpace(c.Email) != "" {
+			det.AttendeeEmail = strings.TrimSpace(c.Email)
+			log.Printf("[SCHEDULE] meeting #%d email peserta diambil dari kontak: %s", m.ID, det.AttendeeEmail)
+		}
+	}
+
 	var attendees []string
 	if isGroup {
 		// Event tunggal grup mengundang SEMUA peserta sekaligus.
@@ -4437,6 +4507,17 @@ func (h *Handler) ResendMeetingRSVP(ctx context.Context, meetingID int64) error 
 	}
 	var det meetingDetails
 	_ = json.Unmarshal(m.Details, &det)
+	// Fallback: bila undangan (det.AttendeeEmail) belum terisi tapi email sudah tercatat di
+	// kontak (mis. email diberi SETELAH finalisasi, sebelum fix backfill diterapkan), ambil
+	// dari contacts agar resend tetap bisa jalan. Hanya solo & non-eksternal.
+	backfilledEmail := false
+	if strings.TrimSpace(det.AttendeeEmail) == "" && m.RequestedVia != "external" && m.ContactID != nil {
+		if c, cerr := h.Store.ContactByID(ctx, int64(*m.ContactID)); cerr == nil && c != nil && strings.TrimSpace(c.Email) != "" {
+			det.AttendeeEmail = strings.TrimSpace(c.Email)
+			backfilledEmail = true
+			log.Printf("[RSVP-RESEND] meeting #%d email peserta diambil dari kontak: %s", meetingID, det.AttendeeEmail)
+		}
+	}
 	if strings.TrimSpace(det.AttendeeEmail) == "" {
 		return fmt.Errorf("meeting #%d tanpa email kontak — tak bisa kirim undangan", meetingID)
 	}
@@ -4452,6 +4533,13 @@ func (h *Handler) ResendMeetingRSVP(ctx context.Context, meetingID int64) error 
 	}); err != nil {
 		log.Printf("[RSVP-RESEND] meeting #%d ke %s gagal: %v", meetingID, det.AttendeeEmail, err)
 		return fmt.Errorf("kirim undangan gagal: %w", err)
+	}
+	// Simpan balik email yang di-backfill agar tercatat di details (undangan berikutnya konsisten).
+	if backfilledEmail {
+		newDetails, _ := json.Marshal(det)
+		if serr := h.Store.ScheduleMeeting(ctx, meetingID, newDetails, "su", "email peserta di-backfill dari kontak saat resend undangan"); serr != nil {
+			log.Printf("[RSVP-RESEND] simpan email meeting #%d gagal: %v", meetingID, serr)
+		}
 	}
 	log.Printf("[RSVP-RESEND] undangan meeting #%d terkirim ulang ke %s", meetingID, det.AttendeeEmail)
 	return nil

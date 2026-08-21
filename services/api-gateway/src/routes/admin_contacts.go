@@ -108,14 +108,32 @@ func (h *Handler) pushAdminContactResult(ctx context.Context, msg string) {
 	h.pushToAdmin(ctx, instr)
 }
 
+// phoneMatchesAny mencocokkan nomor (sudah dinormalisasi) dengan primary + daftar,
+// menormalisasi tiap entri. Dipakai proteksi kontak untuk melindungi SEMUA nomor SU/
+// admin, bukan cuma primary.
+func phoneMatchesAny(phone, primary string, list []string) bool {
+	if phone == "" {
+		return false
+	}
+	if p := adminNormalizePhone(primary); p != "" && phone == p {
+		return true
+	}
+	for _, e := range list {
+		if p := adminNormalizePhone(e); p != "" && phone == p {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Handler) contactProtected(ctx context.Context, phone string) (bool, string) {
 	if phone == "" {
 		return false, ""
 	}
-	if phone == adminNormalizePhone(h.SUPhone) {
+	if phoneMatchesAny(phone, h.SUPhone, h.SUPhones) {
 		return true, "nomor SU"
 	}
-	if adm := adminNormalizePhone(h.AdminPhone); adm != "" && phone == adm {
+	if phoneMatchesAny(phone, h.AdminPhone, h.AdminPhones) {
 		return true, "nomor Admin sendiri"
 	}
 	if h.Store != nil {

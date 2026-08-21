@@ -361,19 +361,34 @@ func (s *Store) upsertContact(ctx context.Context, phone, lid, name, trust strin
 	return err
 }
 
-// SeedTrustedContacts menanam SU & Nova ke whitelist (idempotent).
+// seedRole menanam SEMUA nomor satu peran (SU/admin/support) ke whitelist.
+func (s *Store) seedRole(ctx context.Context, phones, lids []string, name, trust string) error {
+	for i, phone := range phones {
+		lid := ""
+		if i < len(lids) {
+			lid = lids[i]
+		}
+		if err := s.upsertContact(ctx, phone, lid, name, trust); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SeedTrustedContacts menanam SU, Nova (support) & Admin ke whitelist (idempotent).
+// Tiap peran boleh punya BEBERAPA nomor (SU_PHONE dst dipisah , atau ;).
 func (s *Store) SeedTrustedContacts(ctx context.Context, cfg config.Config) error {
-	if err := s.upsertContact(ctx, cfg.SUPhone, cfg.SULid, "Pak Sudianto (SU)", "su"); err != nil {
+	if err := s.seedRole(ctx, cfg.SUPhones, cfg.SULids, "Pak Sudianto (SU)", "su"); err != nil {
 		return err
 	}
-	if err := s.upsertContact(ctx, cfg.NovaPhone, cfg.NovaLid, "Bu Nova", "semi_trusted"); err != nil {
+	if err := s.seedRole(ctx, cfg.NovaPhones, cfg.NovaLids, "Bu Nova", "semi_trusted"); err != nil {
 		return err
 	}
-	if err := s.upsertContact(ctx, cfg.AdminPhone, cfg.AdminLid, "Admin", "admin"); err != nil {
+	if err := s.seedRole(ctx, cfg.AdminPhones, cfg.AdminLids, "Admin", "admin"); err != nil {
 		return err
 	}
-	log.Printf("[db] seed kontak trusted selesai (SU=%s lid=%s, Nova=%s lid=%s, Admin=%s lid=%s)",
-		cfg.SUPhone, cfg.SULid, cfg.NovaPhone, cfg.NovaLid, cfg.AdminPhone, cfg.AdminLid)
+	log.Printf("[db] seed kontak trusted selesai (SU=%v, Nova=%v, Admin=%v)",
+		cfg.SUPhones, cfg.NovaPhones, cfg.AdminPhones)
 	return nil
 }
 
@@ -504,6 +519,28 @@ func (s *Store) FindContact(ctx context.Context, id model.Identifier) (*model.Co
 
 	var c model.Contact
 	err := s.pool.QueryRow(ctx, query, id.Value).Scan(
+		&c.ID, &c.Phone, &c.Lid, &c.Name, &c.Company, &c.Email, &c.TrustLevel)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotWhitelisted
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// ContactByID mengambil kontak aktif berdasarkan PK id. Dipakai finalisasi meeting
+// untuk fallback email peserta (bila det.AttendeeEmail belum terisi tapi email sudah
+// tercatat di contacts dari percakapan). Mengembalikan ErrNotWhitelisted bila tak ada.
+func (s *Store) ContactByID(ctx context.Context, id int64) (*model.Contact, error) {
+	if id <= 0 {
+		return nil, ErrNotWhitelisted
+	}
+	var c model.Contact
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, phone, COALESCE(lid,''), COALESCE(name,''),
+		       COALESCE(company,''), COALESCE(email,''), trust_level
+		FROM contacts WHERE id = $1 AND deleted_at IS NULL`, id).Scan(
 		&c.ID, &c.Phone, &c.Lid, &c.Name, &c.Company, &c.Email, &c.TrustLevel)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotWhitelisted

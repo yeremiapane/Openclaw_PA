@@ -1507,6 +1507,18 @@ func (h *Handler) applyActions(ctx context.Context, convID string, contact *mode
 			// (pemulihan email gagal). Idempoten & non-destruktif → tanpa konfirmasi.
 			act := a
 			go h.adminResendRSVP(contact, act)
+		case "ADMIN_CANCEL_MEETING":
+			// Admin (lewat agent admin) MEMBATALKAN meeting secara SENYAP — status cancelled,
+			// hapus event kalender, batalkan pengingat, tolak approval tertaut — TANPA
+			// notifikasi ke SU/eksternal.
+			act := a
+			go h.adminCancelMeeting(contact, act)
+		case "ADMIN_MESSAGE_SU":
+			// Admin (lewat agent admin) meneruskan pesan/pertanyaan ke Pak Sudianto dan
+			// MENGIRIMNYA NYATA ke WhatsApp SU lewat orchestrator di percakapan SU asli
+			// (pushToOrchestrator).
+			act := a
+			go h.adminMessageSU(contact, act)
 		default:
 			if a.Type != "" {
 				log.Printf("[ACTION] tipe tidak dikenal: %q (diabaikan)", a.Type)
@@ -1812,6 +1824,21 @@ func (h *Handler) recordSpawnMeeting(ctx context.Context, convID, agentID string
 	if contact != nil {
 		name, company, email = contact.Name, contact.Company, contact.Email
 	}
+
+	// Lapis anti-duplikat (jalur SPAWN). Menutup bug "resend konfirmasi → orchestrator
+	// membuat meeting baru": bila sudah ada meeting AKTIF (pending/approved/scheduled)
+	// dengan pihak + waktu sama di percakapan MANA PUN (termasuk yang sudah 'scheduled'
+	// di percakapan ini — yang sengaja tidak "reusable" di atas),
+	if proposed != nil && strings.TrimSpace(name) != "" {
+		if dup, derr := h.Store.FindActiveMeetingByPartyAt(ctx, name, *proposed, ""); derr != nil {
+			log.Printf("[SPAWN-MEETING] cek duplikat conv=%s gagal: %v", convID, derr)
+		} else if dup != nil {
+			log.Printf("[SPAWN-MEETING] duplikat DICEGAH conv=%s: sudah ada meeting #%d (status=%s) pihak=%q datetime=%v — tidak membuat baris baru",
+				convID, dup.ID, dup.Status, name, proposed)
+			return
+		}
+	}
+
 	det := meetingDetails{Title: topic, AttendeeName: name, AttendeeEmail: email, InitiatedBy: strings.TrimSpace(initiatedBy)}
 	// Meeting grup (Fase 1): tandai keanggotaan grup agar konsolidasi (satu approval,
 	// satu koordinasi venue, satu laporan) bisa dilakukan lintas peserta.

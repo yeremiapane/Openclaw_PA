@@ -2,11 +2,13 @@ package routes
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"sort"
 	"strings"
+	"time"
 
 	"pa-ai/api-gateway/src/db"
 	"pa-ai/api-gateway/src/model"
@@ -753,6 +755,135 @@ func (h *Handler) adminResendRSVP(initiator *model.Contact, a model.Action) {
 	}
 	log.Printf("[ADMIN-RESEND] admin kirim ulang undangan meeting #%d", a.MeetingID)
 	h.pushToAdmin(ctx, hdr+fmt.Sprintf("Undangan meeting #%d dikirim ulang. Sampaikan ke Admin.", a.MeetingID))
+}
+
+// adminCancelMeeting menjalankan ADMIN_CANCEL_MEETING: membatalkan meeting secara
+// DETERMINISTIK dan SENYAP — status → cancelled, hapus event kalender O365 bila ada,
+// batalkan pengingat, dan tolak approval tertaut (agar pesan tertahan tidak lepas ke
+// eksternal)
+func (h *Handler) adminCancelMeeting(initiator *model.Contact, a model.Action) {
+	if !adminIsAuthorized(initiator, "ADMIN-CANCEL", a) {
+		return
+	}
+	ctx := context.Background()
+	const hdr = "[HASIL PEMBATALAN MEETING — giliran sistem, BUKAN pesan dari Admin]\n"
+	if a.MeetingID <= 0 {
+		h.pushToAdmin(ctx, hdr+"Gagal: meetingId kosong. Sebutkan meeting mana (lihat ADMIN_FETCH resource=meetings).")
+		return
+	}
+	m, err := h.Store.MeetingByID(ctx, a.MeetingID)
+	if err != nil || m == nil {
+		h.pushToAdmin(ctx, hdr+fmt.Sprintf("Meeting #%d tidak ditemukan.", a.MeetingID))
+		return
+	}
+	if m.Status == "cancelled" || m.Status == "rejected" || m.Status == "superseded" {
+		h.pushToAdmin(ctx, hdr+fmt.Sprintf("Meeting #%d memang sudah %s — tidak ada yang dibatalkan.",
+			a.MeetingID, meetingStatusID(m.Status)))
+		return
+	}
+
+	var det meetingDetails
+	_ = json.Unmarshal(m.Details, &det)
+	who := firstNonEmptyStr(m.ExternalName, det.AttendeeName, "pihak terkait")
+	when := ""
+	if m.ProposedDatetime != nil {
+		when = " (" + formatWIBLong(*m.ProposedDatetime) + ")"
+	}
+	summary := fmt.Sprintf("Anda akan MEMBATALKAN meeting #%d dengan %s%s secara SENYAP — "+
+		"TANPA memberi tahu pihak eksternal maupun Pak Sudianto. Event kalender, pengingat, dan "+
+		"approval tertaut ikut dibersihkan. Tindakan ini tidak bisa dibatalkan.", a.MeetingID, who, when)
+	if h.adminConfirmNeeded(ctx, a.Confirm, summary) {
+		return
+	}
+
+	reason := firstNonEmptyStr(strings.TrimSpace(a.Reason), "dibatalkan senyap oleh admin")
+
+	// 1) Hapus event kalender O365 bila sudah dibuat.
+	calNote := ""
+	if h.Services.Enabled() && det.EventID != "" {
+		if cerr := h.Services.CancelEvent(ctx, det.EventID); cerr != nil {
+			log.Printf("[ADMIN-CANCEL] hapus event meeting #%d gagal: %v", m.ID, cerr)
+			calNote = " (event kalender gagal dihapus — periksa manual)"
+		} else {
+			log.Printf("[ADMIN-CANCEL] event %s meeting #%d dihapus", det.EventID, m.ID)
+		}
+	}
+
+	// 2) Tolak approval tertaut yang masih pending → Senyap: DecideApproval hanya mengubah status, tidak mengirim apa pun.
+	apNote := ""
+	if m.ApprovalID != nil && *m.ApprovalID > 0 {
+		if _, derr := h.Store.DecideApproval(ctx, *m.ApprovalID, "rejected"); derr != nil {
+			if !errors.Is(derr, db.ErrApprovalNotFound) {
+				log.Printf("[ADMIN-CANCEL] tolak approval #%d meeting #%d gagal: %v", *m.ApprovalID, m.ID, derr)
+			}
+		} else {
+			apNote = fmt.Sprintf(" Approval tertaut #%d ditolak.", *m.ApprovalID)
+			log.Printf("[ADMIN-CANCEL] approval #%d meeting #%d ditolak (senyap)", *m.ApprovalID, m.ID)
+		}
+	}
+
+	// 3) Status → cancelled (changedBy=admin). Tanpa notifikasi eksternal/SU.
+	if uerr := h.Store.UpdateMeetingStatus(ctx, m.ID, "cancelled", "admin", reason); uerr != nil {
+		log.Printf("[ADMIN-CANCEL] update status meeting #%d gagal: %v", m.ID, uerr)
+		h.pushToAdmin(ctx, hdr+fmt.Sprintf("Meeting #%d gagal dibatalkan (update status error: %v).", m.ID, uerr))
+		return
+	}
+
+	// 4) Batalkan pengingat otomatis yang masih menunggu untuk meeting ini.
+	if cerr := h.Store.CancelTasksForMeeting(ctx, m.ID); cerr != nil {
+		log.Printf("[ADMIN-CANCEL] batalkan pengingat meeting #%d gagal: %v", m.ID, cerr)
+	}
+
+	// Catatan bila venue offline sempat dikoordinasi: TIDAK melibatkan Bu Nova (menjaga senyap).
+	venueNote := ""
+	if det.VenueCoordination {
+		venueNote = " Catatan: koordinasi venue (Bu Nova) TIDAK diberi tahu — bila perlu, lepaskan booking manual."
+	}
+
+	log.Printf("[ADMIN-CANCEL] admin membatalkan meeting #%d (%s) SENYAP reason=%q", m.ID, who, reason)
+	h.pushToAdmin(ctx, hdr+fmt.Sprintf("Meeting #%d dengan %s%s dibatalkan SENYAP — tidak ada notifikasi "+
+		"terkirim ke pihak eksternal maupun Pak Sudianto.%s%s%s Sampaikan ringkas ke Admin.",
+		m.ID, who, when, apNote, calNote, venueNote))
+}
+
+// adminMessageSU menjalankan ADMIN_MESSAGE_SU: meneruskan pesan/pertanyaan dari Admin
+// KEPADA Pak Sudianto (SU) dan benar-benar MENGIRIMNYA ke WhatsApp beliau. Memakai
+// `pushToOrchestrator` — primitive push proaktif yang menyusun balasan orchestrator di
+// percakapan SU YANG ASLI (agent:orchestrator:<SUPhone>) lalu mengirimkannya ke chat SU
+// dan mencatatnya ke memori percakapan (sehingga bila SU membalas, alurnya normal).
+func (h *Handler) adminMessageSU(initiator *model.Contact, a model.Action) {
+	if !adminIsAuthorized(initiator, "ADMIN-MSG-SU", a) {
+		return
+	}
+	ctx := context.Background()
+	const hdr = "[HASIL PESAN KE SU — giliran sistem, BUKAN pesan dari Admin]\n"
+	task := strings.TrimSpace(a.Task)
+	if task == "" {
+		h.pushToAdmin(ctx, hdr+"Gagal: isi pesan (task) kosong. Tuliskan apa yang ingin disampaikan/ditanyakan ke Pak Sudianto.")
+		return
+	}
+	if strings.TrimSpace(h.SUPhone) == "" {
+		h.pushToAdmin(ctx, hdr+"Gagal: nomor Pak Sudianto (SU) belum dikonfigurasi.")
+		return
+	}
+	if h.adminConfirmNeeded(ctx, a.Confirm,
+		fmt.Sprintf("Anda akan mengirim pesan ini ke Pak Sudianto (SU) via WhatsApp:\n\"%s\"", oneLine(task, 300))) {
+		return
+	}
+
+	directive := "[DIREKTIF ADMIN — sampaikan hal berikut kepada Pak Sudianto dengan bahasamu yang " +
+		"natural & sopan sebagai asistennya. Ini pesan yang HARUS dikirim ke beliau sekarang, " +
+		"bukan sekadar catatan internal. Jangan membuat/menyetujui meeting apa pun; cukup sampaikan.]\n" + task
+
+	// applyActions=false → murni notifikasi, tanpa efek samping (tak membuat/mengubah meeting).
+	if err := h.pushToOrchestrator(ctx, directive, pushOpts{releaseAt: time.Now(), applyActions: false}); err != nil {
+		log.Printf("[ADMIN-MSG-SU] gagal: %v", err)
+		h.pushToAdmin(ctx, hdr+fmt.Sprintf("Pesan ke Pak Sudianto GAGAL terkirim: %v. Sampaikan ke Admin & tawarkan mencoba lagi.", err))
+		return
+	}
+	log.Printf("[ADMIN-MSG-SU] admin mengirim pesan ke SU via orchestrator: %s", oneLine(task, 80))
+	h.pushToAdmin(ctx, hdr+"Pesan sudah DIKIRIM ke Pak Sudianto via WhatsApp. Bila beliau membalas, jawabannya "+
+		"masuk ke percakapan orchestrator-nya dan akan kelihatan di status. Sampaikan ke Admin.")
 }
 
 // oneLine memampatkan teks jadi satu baris dan memotong pada n rune.

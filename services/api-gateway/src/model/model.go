@@ -422,8 +422,12 @@ type Action struct {
 	// ADMIN_APPROVE / ADMIN_REJECT: ApprovalID approval yang menunggu.
 	// ADMIN_BLOCK_EXTERNAL / ADMIN_PROMOTE_EXTERNAL: Target = nomor kontak external.
 	// ADMIN_RESEND_RSVP: MeetingID meeting terjadwal.
-	// Untuk verb destruktif (approve/reject/block/promote), Confirm=true menandai Admin
-	// SUDAH mengonfirmasi. Tanpa Confirm, gateway hanya meminta konfirmasi & TIDAK mengeksekusi.
+	// ADMIN_CANCEL_MEETING: MeetingID (+ opsional Reason) — batalkan meeting SENYAP (tanpa
+	//   notifikasi ke SU/eksternal).
+	// ADMIN_MESSAGE_SU: Task = isi pesan/pertanyaan yang DIKIRIM NYATA ke WhatsApp Pak Sudianto
+	//   lewat orchestrator (percakapan SU asli). Beda dari ADMIN_SPAWN yang balasannya hanya kembali ke Admin.
+	// Untuk verb destruktif/outbound (approve/reject/block/promote/cancel_meeting/message_su), Confirm=true
+	// menandai Admin SUDAH mengonfirmasi. Tanpa Confirm, gateway hanya meminta konfirmasi & TIDAK mengeksekusi.
 	Confirm bool `json:"confirm,omitempty"`
 }
 

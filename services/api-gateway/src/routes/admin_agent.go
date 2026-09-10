@@ -886,6 +886,48 @@ func (h *Handler) adminMessageSU(initiator *model.Contact, a model.Action) {
 		"masuk ke percakapan orchestrator-nya dan akan kelihatan di status. Sampaikan ke Admin.")
 }
 
+// adminMessageSupport menjalankan ADMIN_MESSAGE_SUPPORT: meneruskan pesan/instruksi dari
+// Admin KEPADA Bu Nova (support) dan benar-benar MENGIRIMNYA ke WhatsApp beliau. Memakai
+// `pushToSupport` — primitive push proaktif yang menyusun balasan support di percakapan
+// Nova YANG ASLI (agent:support:<NovaPhone>) lalu mengirimkannya ke chat Nova dan
+// mencatatnya ke memori percakapan (sehingga bila Nova membalas, alurnya normal). Berbeda
+// dari ADMIN_SPAWN yang balasannya hanya kembali ke Admin lewat sesi admin-ctl terisolasi.
+func (h *Handler) adminMessageSupport(initiator *model.Contact, a model.Action) {
+	if !adminIsAuthorized(initiator, "ADMIN-MSG-SUPPORT", a) {
+		return
+	}
+	ctx := context.Background()
+	const hdr = "[HASIL PESAN KE SUPPORT — giliran sistem, BUKAN pesan dari Admin]\n"
+	task := strings.TrimSpace(a.Task)
+	if task == "" {
+		h.pushToAdmin(ctx, hdr+"Gagal: isi pesan (task) kosong. Tuliskan apa yang ingin disampaikan/diminta ke Bu Nova.")
+		return
+	}
+	if strings.TrimSpace(h.NovaPhone) == "" {
+		h.pushToAdmin(ctx, hdr+"Gagal: nomor Bu Nova (support) belum dikonfigurasi.")
+		return
+	}
+	if h.adminConfirmNeeded(ctx, a.Confirm,
+		fmt.Sprintf("Anda akan mengirim pesan ini ke Bu Nova (support) via WhatsApp:\n\"%s\"", oneLine(task, 300))) {
+		return
+	}
+
+	directive := "[DIREKTIF ADMIN — sampaikan hal berikut kepada Bu Nova dengan bahasamu yang " +
+		"natural & sopan. Ini instruksi yang HARUS dikerjakan/disampaikan sekarang, bukan sekadar " +
+		"catatan internal.]\n" + task
+
+	// applyActions=true → instruksi ke Nova boleh langsung memicu aksinya sendiri (mis.
+	// CONFIRM_VENUE bila lokasi sudah dia ketahui), sama seperti koordinasi venue otomatis.
+	if err := h.pushToSupport(ctx, directive, pushOpts{releaseAt: time.Now(), applyActions: true}); err != nil {
+		log.Printf("[ADMIN-MSG-SUPPORT] gagal: %v", err)
+		h.pushToAdmin(ctx, hdr+fmt.Sprintf("Pesan ke Bu Nova GAGAL terkirim: %v. Sampaikan ke Admin & tawarkan mencoba lagi.", err))
+		return
+	}
+	log.Printf("[ADMIN-MSG-SUPPORT] admin mengirim pesan ke Nova via support: %s", oneLine(task, 80))
+	h.pushToAdmin(ctx, hdr+"Pesan sudah DIKIRIM ke Bu Nova via WhatsApp. Bila beliau membalas, jawabannya "+
+		"masuk ke percakapan support-nya dan akan kelihatan di status. Sampaikan ke Admin.")
+}
+
 // oneLine memampatkan teks jadi satu baris dan memotong pada n rune.
 func oneLine(s string, n int) string {
 	s = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\r", " "))

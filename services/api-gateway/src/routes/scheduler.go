@@ -441,6 +441,83 @@ func (h *Handler) pushToOrchestrator(ctx context.Context, task string, opts push
 	return nil
 }
 
+// pushToSupport = padanan pushToOrchestrator untuk Bu Nova (agent "support"): menyusun
+// balasan support DI PERCAKAPAN ASLINYA (agent:support:<NovaPhone>, sama seperti yang
+// dipakai dispatchNovaVenue untuk koordinasi venue) lalu benar-benar MENGIRIMKANNYA ke
+// WhatsApp Nova dan mencatatnya ke memori percakapan — bukan sesi admin-ctl terisolasi
+// yang balasannya hanya kembali ke Admin tanpa efek nyata (bug lama, lihat ADMIN_SPAWN).
+func (h *Handler) pushToSupport(ctx context.Context, task string, opts pushOpts) error {
+	if strings.TrimSpace(h.NovaPhone) == "" {
+		return errors.New("nomor Bu Nova (support) kosong")
+	}
+	const agentID = "support"
+	convID := "agent:" + agentID + ":" + h.NovaPhone
+
+	contact := &model.Contact{Phone: h.NovaPhone, TrustLevel: "semi_trusted", Name: "Bu Nova"}
+	if h.Store != nil {
+		if c, err := h.Store.FindContact(ctx, model.Identifier{Kind: "phone", Value: h.NovaPhone}); err == nil && c.ID > 0 {
+			contact = c
+		}
+	}
+
+	injectMsg := task
+	if h.Memory != nil {
+		if mc, err := h.Memory.Assemble(ctx, convID, contact); err != nil {
+			log.Printf("[PUSH-SUPPORT] assemble konteks gagal conv=%s: %v (lanjut tanpa konteks)", convID, err)
+		} else {
+			mc.LiveStatus = buildDateAnchor()
+			if snap := h.buildMeetingSnapshot(ctx); snap != "" {
+				mc.LiveStatus += "\n\n" + snap
+			}
+			injectMsg = mc.BuildInjectMessage(task)
+		}
+	}
+
+	cl := h.OpenClaw
+	if opts.timeout > 0 {
+		cl = cl.WithTimeout(opts.timeout)
+	}
+	reply, meta, err := h.injectWithRecoveryVia(ctx, cl, agentID, convID, injectMsg)
+	if errors.Is(err, openclaw.ErrNoReply) {
+		h.logExecution(ctx, convID, agentID, contact, injectMsg, nil, meta, "no_reply", "")
+		return errors.New("support memilih diam")
+	}
+	if err != nil {
+		h.logExecution(ctx, convID, agentID, contact, injectMsg, nil, meta, outcomeFromErr(err), err.Error())
+		return err
+	}
+	execID := h.logExecution(ctx, convID, agentID, contact, injectMsg, reply, meta, "ok", "")
+
+	resp := strings.TrimSpace(reply.Response)
+	if resp == "" {
+		return errors.New("support membalas kosong")
+	}
+
+	if wait := time.Until(opts.releaseAt); wait > 0 {
+		log.Printf("[SCHEDULER] pesan ke Bu Nova siap, ditahan %s sampai jatuh tempo", wait.Round(time.Second))
+	}
+	if err := holdUntil(ctx, opts.releaseAt); err != nil {
+		return fmt.Errorf("penahanan dibatalkan: %w", err)
+	}
+
+	if opts.applyActions && len(reply.Actions) > 0 {
+		log.Printf("[PUSH-SUPPORT] menjalankan %d action dari balasan terjadwal", len(reply.Actions))
+		h.applyActions(ctx, convID, contact, reply.Actions, execID, task)
+	}
+
+	if h.Memory != nil {
+		if werr := h.Memory.Write(ctx, convID, contact, agentID, "[Direktif admin diteruskan]", resp, reply.NewFacts); werr != nil {
+			log.Printf("[PUSH-SUPPORT] memory write gagal conv=%s: %v", convID, werr)
+		}
+	}
+	h.sendAndRecord(ctx, func() error { return h.Waha.SendText(h.NovaPhone, resp) },
+		model.OutboundMessage{
+			ExecutionID: execPtr(execID), ConversationID: convID, ContactID: cidPtr(contact),
+			AgentID: agentID, TargetChat: h.NovaPhone, Kind: "proactive_reply", Text: resp,
+		})
+	return nil
+}
+
 // reconcileUnfinalizedOfflineMeetings: tuntaskan meeting offline yang disetujui tapi
 // belum difinalisasi. Dipanggil sekali saat start-up; idempoten.
 func (h *Handler) reconcileUnfinalizedOfflineMeetings(ctx context.Context) {

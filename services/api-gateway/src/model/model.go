@@ -426,8 +426,11 @@ type Action struct {
 	//   notifikasi ke SU/eksternal).
 	// ADMIN_MESSAGE_SU: Task = isi pesan/pertanyaan yang DIKIRIM NYATA ke WhatsApp Pak Sudianto
 	//   lewat orchestrator (percakapan SU asli). Beda dari ADMIN_SPAWN yang balasannya hanya kembali ke Admin.
-	// Untuk verb destruktif/outbound (approve/reject/block/promote/cancel_meeting/message_su), Confirm=true
-	// menandai Admin SUDAH mengonfirmasi. Tanpa Confirm, gateway hanya meminta konfirmasi & TIDAK mengeksekusi.
+	// ADMIN_MESSAGE_SUPPORT: Task = isi pesan/instruksi yang DIKIRIM NYATA ke WhatsApp Bu Nova
+	//   lewat agent support (percakapan Nova asli). Padanan ADMIN_MESSAGE_SU untuk Nova.
+	// Untuk verb destruktif/outbound (approve/reject/block/promote/cancel_meeting/message_su/
+	// message_support), Confirm=true menandai Admin SUDAH mengonfirmasi. Tanpa Confirm, gateway
+	// hanya meminta konfirmasi & TIDAK mengeksekusi.
 	Confirm bool `json:"confirm,omitempty"`
 }
 

@@ -1519,6 +1519,12 @@ func (h *Handler) applyActions(ctx context.Context, convID string, contact *mode
 			// (pushToOrchestrator).
 			act := a
 			go h.adminMessageSU(contact, act)
+		case "ADMIN_MESSAGE_SUPPORT":
+			// Admin (lewat agent admin) meneruskan pesan/instruksi ke Bu Nova dan
+			// MENGIRIMNYA NYATA ke WhatsApp Nova di percakapan support asli
+			// (pushToSupport).
+			act := a
+			go h.adminMessageSupport(contact, act)
 		default:
 			if a.Type != "" {
 				log.Printf("[ACTION] tipe tidak dikenal: %q (diabaikan)", a.Type)
@@ -1565,10 +1571,13 @@ func (h *Handler) spawnOutbound(initiator *model.Contact, act model.Action, srcT
 		return
 	}
 
-	// Koordinasi venue ke Bu Nova otomatis setelah SU menyetujui waktu.
-	// Spawn manual ke 'support' diblokir agar pesan venue tidak terkirim terlalu awal.
-	if agentID == "support" {
-		log.Printf("[SPAWN] support DITOLAK: koordinasi venue kini otomatis setelah SU menyetujui waktu (spawn manual diabaikan)")
+	// Koordinasi venue ke Bu Nova otomatis setelah SU menyetujui waktu — spawn manual
+	// yang MEMBAWA field meeting (topic/venue/datetime) diblokir agar pesan venue tidak
+	// terkirim terlalu awal/dobel. Tugas lain ke Bu Nova yang TIDAK terkait venue meeting
+	// (mis. minta bantuan administratif) tetap diizinkan lewat jalur ini.
+	if agentID == "support" && (strings.TrimSpace(act.MeetingTopic) != "" ||
+		strings.TrimSpace(act.MeetingVenue) != "" || strings.TrimSpace(act.MeetingDatetime) != "") {
+		log.Printf("[SPAWN] support DITOLAK: tampak koordinasi venue meeting — itu kini otomatis setelah SU menyetujui waktu (spawn manual diabaikan)")
 		return
 	}
 
